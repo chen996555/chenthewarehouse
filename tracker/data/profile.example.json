@@ -1,0 +1,76 @@
+{
+  "meta": {
+    "owner": "张三",
+    "updated": "2026-08"
+  },
+  "identity": {
+    "legal_name": "张三",
+    "gender": "男",
+    "birth_date": "2000-01-01",
+    "hometown": "某省某市",
+    "political_status": "团员",
+    "id_number": "（投递时现场填写）"
+  },
+  "contact": {
+    "phone": "13800000000",
+    "email": "example@email.com",
+    "province_city": "北京"
+  },
+  "background": {
+    "education": [
+      {
+        "school": "某大学",
+        "degree": "硕士",
+        "major": "某专业",
+        "start": "2025-09",
+        "end": "2027-06"
+      }
+    ],
+    "certificates": [
+      "证书示例"
+    ],
+    "skills": [
+      "技能示例"
+    ],
+    "experience_summary": "（画像摘要，由 portrait.js 从简历生成，也可手工填写）",
+    "work_experience": [
+      {
+        "company": "某公司",
+        "title": "某岗位",
+        "start": "2026-04",
+        "end": "2026-08",
+        "highlights": "成果示例"
+      }
+    ]
+  },
+  "job_search": {
+    "target_roles": [
+      "采购 / 供应链"
+    ],
+    "target_industries": [
+      "互联网/科技"
+    ],
+    "cities": [
+      "北京",
+      "上海",
+      "广州",
+      "深圳"
+    ],
+    "salary_floor": null,
+    "exclude_keywords": [],
+    "graduation_year": "2027届",
+    "company_limit": 3
+  },
+  "files": {
+    "resumes": [
+      {
+        "label": "简历标签",
+        "path": "C:\\path\\to\\resume.pdf",
+        "directions": [
+          "采购",
+          "供应链"
+        ]
+      }
+    ]
+  }
+}

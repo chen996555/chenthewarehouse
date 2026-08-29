@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>求职星计划</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⭐</span>
+      <h1>求职星计划</h1>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="board">投递看板</button>
+      <button class="tab" data-tab="scrape">官网岗位</button>
+      <button class="tab" data-tab="search">岗位库</button>
+    </nav>
+    <div class="stats" id="stats"></div>
+    <button class="btn primary" id="new-btn">＋ 新建投递</button>
+  </header>
+
+  <main>
+    <!-- 看板视图 -->
+    <div class="view" id="board-view">
+      <section class="board" id="board"></section>
+      <aside class="activity" id="activity"></aside>
+    </div>
+
+    <!-- 找岗位视图 -->
+    <section class="view search-view" id="search-view" hidden>
+      <div class="search-form">
+        <input id="search-kw" placeholder="关键词，如：AI 产品 实习" />
+        <input id="search-city" placeholder="城市，如：深圳" />
+        <select id="search-type"><option value="">类型</option></select>
+        <select id="search-degree"><option value="">学历</option></select>
+        <select id="search-industry"><option value="">行业</option></select>
+        <select id="search-tier"><option value="">规模</option></select>
+        <button class="btn primary" id="search-btn">搜索</button>
+      </div>
+      <div class="data-note" id="data-note"></div>
+      <div class="search-results" id="search-results">
+        <div class="empty">输入关键词后点击「搜索」</div>
+      </div>
+    </section>
+
+    <!-- 官网真实岗位视图 -->
+    <section class="view search-view" id="scrape-view" hidden>
+      <div class="search-form">
+        <select id="scrape-company"></select>
+        <input id="scrape-subdomain" placeholder="自定义 zhiye.com 子域名" style="display:none" />
+        <select id="scrape-section">
+          <option value="campus">校园招聘</option>
+          <option value="social">社会招聘</option>
+          <option value="intern">实习生招聘</option>
+        </select>
+        <input id="scrape-keyword" placeholder="关键词（可选，如 产品）" />
+        <button class="btn primary" id="scrape-btn">抓取真实岗位</button>
+        <button class="btn primary" id="scan-btn" title="自动遍历已点亮的互联网公司抓校招岗 → 打分 → A/B 档导入待投">🚀 一键扫描全部</button>
+      </div>
+      <div class="data-note" id="scrape-note">真实在招岗位 · 数据来自公司官网（北森 zhiye.com），含编号与发布日期</div>
+      <div class="search-results" id="scrape-results">
+        <div class="empty">从下拉选择公司（或选「自定义」填 zhiye.com 子域名）后点「抓取」</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 新建/编辑弹窗 -->
+  <div class="modal-mask" id="modal-mask" hidden>
+    <form class="modal" id="app-form">
+      <div class="modal-head">
+        <h2 id="modal-title">新建投递</h2>
+        <button type="button" class="icon-btn" id="close-btn" title="关闭">✕</button>
+      </div>
+
+      <div class="field-row">
+        <label>公司 <span class="req">*</span>
+          <input name="company" required placeholder="如：字节跳动" />
+        </label>
+        <label>岗位 <span class="req">*</span>
+          <input name="title" required placeholder="如：AI 产品实习" />
+        </label>
+      </div>
+
+      <div class="field-row">
+        <label>渠道
+          <input name="channel" list="channel-list" placeholder="官网" />
+        </label>
+        <label>状态
+          <select name="status" id="status-select"></select>
+        </label>
+      </div>
+
+      <div class="field-row">
+        <label>城市
+          <input name="city" placeholder="如：深圳" />
+        </label>
+        <label>薪资
+          <input name="salary" placeholder="如：15-20K" />
+        </label>
+      </div>
+
+      <label>岗位链接
+        <input name="url" type="url" placeholder="https://…（官网投递页）" />
+      </label>
+
+      <label>跟进提醒日期
+        <input name="follow_up_date" type="date" />
+      </label>
+
+      <label>备注
+        <textarea name="notes" rows="3" placeholder="投递进度、联系人、JD 要点…"></textarea>
+      </label>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="cancel-btn">取消</button>
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>
+  </div>
+
+  <datalist id="channel-list"></datalist>
+
+  <script src="app.js"></script>
+</body>
+</html>

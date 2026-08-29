@@ -1,0 +1,15 @@
+# 本地数据与密钥：不要提交、不要打包分享
+# 排除 data/ 下的敏感文件（个人隐私、登录态、岗位库、缓存）；profile.example.json 是脱敏示例，保留上传
+tracker/data/profile.json
+tracker/data/tracker.db
+tracker/data/score-cache.json
+tracker/data/scan-health.json
+tracker/data/browser-profile/
+
+# 依赖与下载产物
+node_modules/
+*.zip
+
+# 参考/其他项目：不随本仓库提交（各自独立仓库）
+BossHunter/
+job-hunter/
