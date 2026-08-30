@@ -11,7 +11,7 @@
 
 const BASE = 'https://zhaopin.meituan.com';
 
-async function fetchMtPage({ pageNo, pageSize, keyword }) {
+async function fetchMtPage({ pageNo, pageSize, keyword, jobType }) {
   const body = JSON.stringify({
     page: { pageNo, pageSize },
     jobShareType: '1',
@@ -19,7 +19,7 @@ async function fetchMtPage({ pageNo, pageSize, keyword }) {
     cityList: [],
     department: [],
     jfJgList: [],
-    jobType: [{ code: '1', subCode: [] }, { code: '2', subCode: [] }],
+    jobType: jobType || [{ code: '1', subCode: [] }, { code: '2', subCode: [] }],
     typeCode: [],
     specialCode: [],
   });
@@ -48,22 +48,26 @@ function fmtDate(epochMs) {
 function mapMtJob(item) {
   const deptArr = Array.isArray(item.department) ? item.department : [];
   const cityArr = Array.isArray(item.cityList) ? item.cityList : [];
-  const TYPE_MAP = { '1': '应届', '2': '转正实习', '3': '日常实习' };
+  const TYPE_MAP = { '1': '校招应届', '2': '实习', '3': '社招' };
+  const SECTION_MAP = { '1': 'campus', '2': 'intern', '3': 'social' };
   return {
     id: String(item.jobUnionId || ''),
     title: item.name || '',
     team: deptArr.map((d) => d.name).filter(Boolean).join('/'),
     location: cityArr.map((c) => c.name).filter(Boolean).join('、'),
     type: TYPE_MAP[String(item.jobType)] || item.jobType || '',
+    section: SECTION_MAP[String(item.jobType)] || '',
     category: [item.jobFamilyGroup, item.jobFamily].filter(Boolean).join('·'),
     program: item.projectName || '',
     date: fmtDate(item.refreshTime || item.firstPostTime),
-    detailUrl: `${BASE}/web/campus`,
+    detailUrl: item.jobUnionId ? `${BASE}/web/position/detail?jobUnionId=${item.jobUnionId}&jobShareType=1&highlightType=${item.jobType === '3' ? 'social' : 'campus'}` : `${BASE}/web/campus`,
     jd: [item.jobDuty, item.jobRequirement].filter(Boolean).join('\n'),
   };
 }
 
-async function scrapeMt({ keyword = '', maxJobs = 100, fallbackName = '美团' } = {}) {
+async function scrapeMt({ keyword = '', maxJobs = 100, fallbackName = '美团', section = 'campus' } = {}) {
+  // 按 scope 决定 jobType：校招=应届(1)+实习(2)，社招=3（应届生不抓社招，避免浪费）
+  const jobType = section === 'social' ? [{ code: '3', subCode: [] }] : [{ code: '1', subCode: [] }, { code: '2', subCode: [] }];
   const cap = Math.min(Math.max(Number(maxJobs) || 100, 10), 300);
   const pageSize = 50;
   const seen = new Set();
@@ -71,7 +75,7 @@ async function scrapeMt({ keyword = '', maxJobs = 100, fallbackName = '美团' }
   let total = 0;
 
   for (let pageNo = 1; jobs.length < cap; pageNo++) {
-    const data = await fetchMtPage({ pageNo, pageSize, keyword });
+    const data = await fetchMtPage({ pageNo, pageSize, keyword, jobType });
     const pageInfo = data.page || {};
     if (pageNo === 1) total = Number(pageInfo.totalCount || pageInfo.total || 0);
     const items = data.list || [];

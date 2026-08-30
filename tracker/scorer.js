@@ -179,6 +179,17 @@ async function callLLM(messages, { temperature = 0.2, maxTokens = 20000, model =
     throw new Error(`LLM 调用失败 HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
   const data = await res.json();
+  if (data.usage) {
+    const pt = data.usage.prompt_tokens || 0;
+    const ct = data.usage.completion_tokens || 0;
+    require('./logger').llm('LLM 调用', {
+      model,
+      promptTokens: pt,
+      completionTokens: ct,
+      totalTokens: data.usage.total_tokens || (pt + ct),
+      costEst: Math.round((pt * 0.5 + ct * 2) / 10000) / 100, // 粗略成本（元，deepseek-chat 价目）
+    });
+  }
   const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
   if (!content.trim()) {
     throw new Error('模型返回空内容（输出被截断），已自动缩小批次重试');
@@ -215,7 +226,7 @@ function buildProfileSystem(profile) {
 // 岗位列表 → user 消息（判定版：抽取硬要求 + 4 项低分辨率判定）
 function buildJudgeUser(jobs) {
   const jobLines = jobs.map((j, i) => {
-    const jd = String(j.jd || '').replace(/\s+/g, ' ').slice(0, 800);
+    const jd = String(j.jd || '').replace(/\s+/g, ' ').slice(0, 400);
     const meta = [
       j.location ? `地点:${j.location}` : '',
       j.type ? `类型:${j.type}` : '',
@@ -249,7 +260,7 @@ ${jobLines}
 // 判定调用（非推理模型）：返回 [{idx(全局), hard_reqs, judge}]
 async function judgeJobs(jobs, profile, model = LLM_CONFIG.judgeModel) {
   const chunkSize = 8;    // 8 岗一批：既不截断，又不让非推理模型偷懒打 0 分
-  const concurrency = 3;  // 并行批次（触发限流时降到 2）
+  const concurrency = 8;  // 并行批次（触发限流时降到 2）
 
   const chunks = [];
   for (let i = 0; i < jobs.length; i += chunkSize) {
@@ -463,6 +474,7 @@ function diversityPick(ranked, cap, maxPerCompany) {
 // ---- 主入口 ------------------------------------------------------------------
 
 async function scoreJobs(jobs, opts = {}) {
+  const progress = opts.onProgress || (() => {});
   const profile = opts.profile || loadProfile();
   const companyLimit = Number(profile.job_search.company_limit || 3);
   const rrCap = Number(opts.rrCap || 150); // 进 LLM 判定的岗位数上限（语义重排 top N）
@@ -487,15 +499,22 @@ async function scoreJobs(jobs, opts = {}) {
   }
 
   // 阶段 2：语义重排（reranker 全量排序；失败回退关键词粗排）
+  // 岗位太多（>300）先本地关键词粗排取 top 300，避免 reranker API documents 超限 + 减少排序耗时
+  progress(`硬过滤通过 ${kept.length} 个，语义重排中…`);
+  let rerankPool = kept;
+  if (opts.preFilter !== false && kept.length > 300) {
+    rerankPool = keywordPreRank(kept, profile).slice(0, 300).map((x) => x.job);
+  }
   let ranked; // [{job, score}] 降序
   let rerankerMode = 'api';
+  progress(`语义重排 ${rerankPool.length} 个…`);
   try {
-    const rr = await reranker.rerank(kept, profile);
+    const rr = await reranker.rerank(rerankPool, profile);
     if (rr && rr.length) ranked = rr.map((x) => ({ job: x.job, score: x.score }));
     else throw new Error('reranker 返回空');
   } catch {
     rerankerMode = 'keyword';
-    ranked = keywordPreRank(kept, profile).map((x) => ({ job: x.job, score: x.score }));
+    ranked = keywordPreRank(rerankPool, profile).map((x) => ({ job: x.job, score: x.score }));
   }
 
   // 阶段 3：取 top rrCap + 公司多样性（避免单一公司占满判定池）
@@ -523,6 +542,7 @@ async function scoreJobs(jobs, opts = {}) {
   }
 
   let llmDegraded = false;
+  progress(`LLM 判定 ${uncached.length} 个（缓存命中 ${cacheHits}）…`);
   if (uncached.length) {
     try {
       const judged = await judgeJobs(uncached.map((e) => e.job), profile, LLM_CONFIG.judgeModel);
@@ -589,6 +609,7 @@ async function scoreJobs(jobs, opts = {}) {
     const need = rankedAll.filter((j) => (j.tier === 'A' || j.tier === 'B') && j.jdMissing && (j.detailUrl || j.url));
     const toFetch = need.slice(0, Number(opts.maxDetailFetch || 20));
     if (toFetch.length) {
+      progress(`补抓 ${toFetch.length} 个 JD 详情…`);
       try {
         const fetched = await detail.fetchJobDetails(toFetch, { concurrency: 3 });
         const merged = [];
@@ -635,6 +656,7 @@ async function scoreJobs(jobs, opts = {}) {
   const tiers = { A: [], B: [], C: [], D: [] };
   for (const item of rankedAll) tiers[item.tier].push(item);
   const { recommended, overflow } = applyCompanyBudget(rankedAll, companyLimit);
+  progress('分档完成');
 
   return {
     total: jobs.length,

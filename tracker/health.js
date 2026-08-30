@@ -26,10 +26,14 @@ function loadHealth() {
 }
 
 // 对比本次 perCompany vs 上次基线，返回 { issues, ownerChanged }
-function checkHealth(prev, perCompany, owner) {
+function checkHealth(prev, perCompany, owner, keywordHash) {
   // 画像切换（换人）：旧基线不适用，不对比（避免换人岗位数变化误报「疑似」）
   if (prev && prev.owner && owner && prev.owner !== owner) {
     return { issues: [], ownerChanged: true, from: prev.owner, to: owner };
+  }
+  // 画像关键词变了（去复合词/换关键词策略）→ 岗位数变化是预期重校准，不对比
+  if (prev && prev.keywordHash && keywordHash && prev.keywordHash !== keywordHash) {
+    return { issues: [], keywordChanged: true, from: prev.keywordHash, to: keywordHash };
   }
   const issues = [];
   const prevMap = (prev && prev.companies) || {};
@@ -41,6 +45,12 @@ function checkHealth(prev, perCompany, owner) {
     }
     const prevC = prevMap[c.company];
     if (!prevC || !prevC.count) continue; // 无基线或上次本身为 0，不做对比
+
+    // 搜索模式降级：上次关键词精准、本次回退全量 → 关键词搜索失效（比岗位数对比更直接的失效信号）
+    if (prevC.searchMode === 'keyword' && c.searchMode === 'fallback') {
+      issues.push({ company: c.company, level: 'warn', msg: `关键词搜索失效/未命中（上次 keyword，本次 fallback 全量抓，请排查适配器或画像关键词）` });
+      continue; // 降级导致的岗位数暴增是表象，跳过数量对比避免误报「官方变化」
+    }
 
     const ratio = c.count / prevC.count;
     const diff = Math.abs(c.count - prevC.count);
@@ -57,14 +67,15 @@ function checkHealth(prev, perCompany, owner) {
 }
 
 // 保存本次健康基线（只落抓取结果，不落精排；记录 owner 供换人检测）
-function saveHealth(perCompany, totalJobs, owner) {
+function saveHealth(perCompany, totalJobs, owner, keywordHash) {
   const companies = {};
   for (const c of perCompany) {
-    companies[c.company] = { count: c.count || 0, ok: c.ok, error: c.error || '' };
+    companies[c.company] = { count: c.count || 0, ok: c.ok, error: c.error || '', searchMode: c.searchMode || '' };
   }
   const data = {
     updated: new Date().toISOString(),
     owner: owner || '',
+    keywordHash: keywordHash || '',
     totalJobs,
     companies,
   };

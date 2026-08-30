@@ -36,7 +36,7 @@ function buildQuery(profile) {
 
 // 岗位 → 文档文本
 function buildDoc(job) {
-  return [job.title || '', job.jd || ''].join(' ').replace(/\s+/g, ' ').slice(0, 1000);
+  return [job.title || '', job.jd || ''].join(' ').replace(/\s+/g, ' ').slice(0, 400);
 }
 
 // ---- 档位 1：云端 API（硅基流动） --------------------------------------------

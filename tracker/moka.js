@@ -1,152 +1,170 @@
 'use strict';
 
 /**
- * 求职星计划 — Moka（mokahr.com）适配器（适配器 #4）
- * 覆盖：搜狐、新浪微博、携程、唯品会等使用 Moka 招聘系统的公司。
+ * 求职星计划 — Moka（mokahr.com）适配器（纯 HTTP 接口版）
+ * 覆盖：滴滴、大疆、唯品会、新浪微博、搜狐等使用 Moka 招聘系统的公司。
  *
- * Moka 的 API 响应是加密的（data 为密文），无法直连；
- * 但岗位列表在页面渲染后是明文 DOM：`#/jobs` 哈希路由 + 卡片链接 a[href^="#/job/"]。
- * 卡片文本格式：`[急 ]{标题} 发布于 {日期} {部门} {部门}`
+ * 机制（参考 job-pro 的 moka.ts，已实测验证）：
+ *   1. GET portal 页面（base/kind/org/siteId）→ 从 <input id="init-data"> 解析 aesIv + cookie
+ *   2. POST /api/outer/ats-apply/website/jobs/v2?orgId=<org>，body 带 keyword（server-side 匹配）
+ *   3. 响应是 AES-CBC 加密（{data, necromancer}）：key=necromancer(utf8)，iv=aesIv(utf8)，aes-128-cbc
+ *   4. 解密取 dec.data.jobs[] + dec.data.jobStats.total（带 keyword 时 total 是过滤后计数）
+ *
+ * 相比旧 DOM 抓取（#/jobs?keyword= 哈希搜索）的改进：
+ *   - 纯 HTTP，不依赖浏览器、不受前端改版影响
+ *   - keyword 是后端匹配（server-side），而非前端哈希路由（部分租户不支持）
+ *   - limit 上限 50（100 会返回 code 102 参数错误）
  */
 
-let puppeteer;
-try {
-  puppeteer = require('puppeteer-core');
-} catch {
-  puppeteer = require('../job-hunter/node_modules/puppeteer-core');
+const crypto = require('node:crypto');
+
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
+const SECTION_TYPE = { campus: 'campus-recruitment', social: 'social-recruitment', intern: 'campus-recruitment' };
+const MAX_LIMIT = 50; // 上游 limit 上限，100 会返回 code 102
+
+// ---- HTML 解码 + init-data 解析 --------------------------------------------
+
+function htmlDecode(s) {
+  return s
+    .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#x27;/g, "'").replace(/&#39;/g, "'").replace(/&amp;/g, '&');
 }
 
-const EDGE_PATH = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+function parseInitData(html) {
+  const m = html.match(/<input[^>]*id="init-data"[^>]*value="([^"]+)"/);
+  if (!m) return null;
+  try { return JSON.parse(htmlDecode(m[1])); } catch { return null; }
+}
 
-// 版块 → Moka 路径类型
-const SECTION_TYPE = { campus: 'campus-recruitment', social: 'social-recruitment', intern: 'campus-recruitment' };
+function decryptMoka(envelope, aesIv) {
+  if (!envelope || !envelope.data || !envelope.necromancer || !aesIv) return null;
+  try {
+    const key = Buffer.from(envelope.necromancer, 'utf8');
+    const iv = Buffer.from(aesIv, 'utf8');
+    const d = crypto.createDecipheriv('aes-128-cbc', key, iv);
+    return JSON.parse(Buffer.concat([d.update(Buffer.from(envelope.data, 'base64')), d.final()]).toString('utf8'));
+  } catch { return null; }
+}
 
-// 解析岗位卡片文本（两种格式）
-function parseMokaCard(text, href) {
-  const t = String(text || '').replace(/\s+/g, ' ');
-  const hrefId = (String(href || '').match(/\/job\/([0-9a-f-]+)/) || [])[1] || '';
+function htmlToText(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6]|tr|td|th|ul|ol|section)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 
-  // 标准格式：[急 ]{标题} 发布于 {日期} {部门}
-  const m = t.match(/^(?:急\s*)?(.+?)\s*发布于\s*(\d{4}-\d{2}-\d{2})\s*(.+)$/);
-  if (m) {
-    const dept = m[3].trim().split(/\s+/)[0] || '';
-    return { id: hrefId, title: m[1].trim(), date: m[2], team: dept, location: '', type: '', program: '', detailUrl: href || '', jd: '' };
-  }
+// ---- 抓取 -------------------------------------------------------------------
 
-  // 兜底格式（无发布日期，如大疆）：热招 {标题} {部门} {部门} | {地点} {地点} 职位简介…
-  const clean = t.replace(/热招|急\s*/g, '').replace(/职位简介.*$/, '').trim();
-  const segs = clean.split('|').map((s) => s.trim()).filter(Boolean);
-  const head = (segs[0] || '').split(/\s+/);
-  const locDedup = (segs[1] || '').match(/^(\S+)\s+\1/);
+// 第一步：GET portal 拿 cookie（Moka 有 locale-cookie 302 跳转）再拿 HTML
+async function fetchPortalHtml(url) {
+  const r1 = await fetch(url, { method: 'GET', headers: { 'User-Agent': UA }, redirect: 'manual' });
+  const cookies = [];
+  const setCookie = r1.headers.get('set-cookie');
+  if (setCookie) cookies.push(...setCookie.split(/,(?=[^;]+=)/).map((c) => c.split(';')[0].trim()));
+  const r2 = await fetch(url, { method: 'GET', headers: { 'User-Agent': UA, Cookie: cookies.join('; ') }, redirect: 'follow' });
+  const html = await r2.text();
+  return { html, cookieHeader: cookies.join('; ') };
+}
+
+// 第二步：POST jobs/v2（带 keyword），解密返回一页岗位
+async function fetchPage({ org, siteId, pageNum, pageSize, aesIv, cookieHeader, baseUrl, portalUrl, keyword }) {
+  const limit = Math.min(Math.max(Number(pageSize) || 20, 1), MAX_LIMIT);
+  const body = { orgId: org, siteId: String(siteId), limit, offset: (Math.max(1, pageNum) - 1) * limit, needStat: true, locale: 'zh-CN' };
+  if (keyword) body.keyword = keyword;
+  const res = await fetch(`${baseUrl}/api/outer/ats-apply/website/jobs/v2?orgId=${encodeURIComponent(org)}`, {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      Accept: 'application/json,*/*',
+      'Content-Type': 'application/json',
+      Origin: baseUrl,
+      Referer: portalUrl,
+      Cookie: cookieHeader,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return { jobs: [], total: 0 };
+  const envelope = await res.json().catch(() => null);
+  const dec = decryptMoka(envelope, aesIv);
+  if (!dec || dec.code !== 0 || !dec.data) return { jobs: [], total: 0 };
+  return { jobs: dec.data.jobs || [], total: (dec.data.jobStats && dec.data.jobStats.total) || 0 };
+}
+
+// Moka 岗位 → 统一 job 结构
+function mapMokaJob(j, baseUrl, kind, org, siteId) {
+  const id = String(j.id || '');
+  const cities = (j.locations || []).map((l) => l.cityName || l.country || '').filter(Boolean);
+  const uniq = [...new Set(cities)];
   return {
-    id: hrefId,
-    title: head[0] || '',
-    team: head[1] || '',
-    location: locDedup ? locDedup[1] : '',
-    date: '',
-    type: '',
-    program: '',
-    detailUrl: href || '',
-    jd: '',
+    id,
+    title: j.title || '',
+    team: (j.department && j.department.name) || '',
+    location: uniq.join(' / '),
+    date: j.publishedAt || j.openedAt || '',
+    type: j.commitment || (j.hireMode === 1 ? '全职' : j.hireMode === 2 ? '实习' : ''),
+    section: j.hireMode === 2 ? 'intern' : (/social/.test(kind) ? 'social' : 'campus'),
+    program: (j.zhineng && j.zhineng.name) || '',
+    detailUrl: `${baseUrl}/${kind}/${org}/${siteId}#/job/${id}`,
+    jd: htmlToText(j.jobDescription || ''),
   };
 }
 
 /**
- * 抓取 Moka 系统的岗位
- * @param {string} org     机构标识（如搜狐 sohu）
- * @param {string} siteId  站点 ID（如 43256）
- * @param {string} section campus | social | intern
- * @param {string} base    Moka 站点基地址（如 https://hr.sohu.com）
- * @param {number} maxJobs 目标条数上限
+ * 抓取 Moka 系统岗位（纯 HTTP）
+ * @param {string} org        机构标识（如 didiglobal）
+ * @param {string} siteId     站点 ID（如 96064）
+ * @param {string} section    campus | social | intern
+ * @param {string} base       站点基地址（如 https://campus.didiglobal.com）
+ * @param {string} pathPrefix 路径类型（如 campus_apply，缺省按 section 推断）
+ * @param {string|string[]} keyword 关键词（字符串或数组，数组时逐个搜合并去重）
+ * @param {number} maxJobs    目标条数上限
  */
 async function scrapeMoka({ org, siteId, section = 'social', base, pathPrefix, keyword = '', maxJobs = 200, fallbackName = '' } = {}) {
   if (!org || !siteId) throw new Error('缺少 Moka 机构参数（org/siteId）');
-  const pathType = pathPrefix || SECTION_TYPE[section] || 'social-recruitment';
+  const kind = pathPrefix || SECTION_TYPE[section] || 'social-recruitment';
   const baseUrl = String(base || 'https://app.mokahr.com').replace(/\/+$/, '');
-  const listUrl = `${baseUrl}/${pathType}/${org}/${siteId}#/jobs`;
+  const portalUrl = `${baseUrl}/${kind}/${org}/${siteId}`;
   const cap = Math.min(Math.max(Number(maxJobs) || 200, 10), 300);
+
+  // 1. GET portal → aesIv + cookie
+  const { html, cookieHeader } = await fetchPortalHtml(portalUrl);
+  const init = parseInitData(html);
+  if (!init || !init.aesIv) throw new Error('Moka init-data 缺失 aesIv（portal 地址或页面结构可能已变）');
+
+  // 2. 关键词循环搜 + 分页累积
   const keywords = Array.isArray(keyword) ? keyword : (keyword ? [keyword] : ['']);
+  const seen = new Set();
+  const jobs = [];
 
-  const browser = await puppeteer.launch({
-    executablePath: EDGE_PATH,
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-gpu', '--no-proxy-server'],
-  });
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-    );
-    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await new Promise((r) => setTimeout(r, 9000)); // 等 SPA 渲染岗位列表
-
-    // 循环关键词搜索 + 翻页累积（哈希路由 #/jobs?keyword=xxx&page=N）
-    const seen = new Set();
-    const jobs = [];
-    const maxPages = Math.ceil(cap / 10) + 5;
-    for (const kw of keywords) {
-      await page.evaluate((kw) => {
-        location.hash = `#/jobs${kw ? `?keyword=${encodeURIComponent(kw)}` : ''}`;
-      }, kw);
-      await new Promise((r) => setTimeout(r, 5000));
-
-      for (let p = 1; p <= maxPages; p++) {
-        if (p > 1) {
-          await page.evaluate(({ n, kw }) => {
-            location.hash = `#/jobs?${kw ? `keyword=${encodeURIComponent(kw)}&` : ''}page=${n}`;
-          }, { n: p, kw });
-          await new Promise((r) => setTimeout(r, 5000));
-        }
-        const before = jobs.length;
-        const cards = await page.evaluate(() => {
-          return Array.from(document.querySelectorAll('a[href^="#/job/"]')).map((a) => ({
-            text: a.innerText || '',
-            href: a.getAttribute('href') || '',
-          }));
-        });
-        for (const c of cards) {
-          const job = parseMokaCard(c.text, c.href);
-          if (!job || !job.id || seen.has(job.id)) continue;
-          seen.add(job.id);
-          jobs.push({ ...job, detailUrl: `${baseUrl}/${pathType}/${org}/${siteId}${job.detailUrl}` });
-        }
-        if (jobs.length >= cap) break;
-        if (jobs.length === before) break; // 本页无新增，视为到底
+  for (const kw of keywords) {
+    let total = 0;
+    for (let p = 1; ; p++) {
+      const { jobs: pageJobs, total: t } = await fetchPage({ org, siteId, pageNum: p, pageSize: MAX_LIMIT, aesIv: init.aesIv, cookieHeader, baseUrl, portalUrl, keyword: kw });
+      if (p === 1) total = t || 0;
+      for (const j of pageJobs) {
+        const id = String(j.id || '');
+        if (id && !seen.has(id)) { seen.add(id); jobs.push(mapMokaJob(j, baseUrl, kind, org, siteId)); }
       }
-      if (jobs.length >= cap) break;
+      if (pageJobs.length < MAX_LIMIT) break;         // 本页不满 → 到底
+      if (jobs.length >= cap) break;                   // 到上限
+      if (total && p * MAX_LIMIT >= total) break;      // 已拉满
     }
-
-    const company = fallbackName || org;
-    return {
-      company,
-      url: listUrl,
-      section,
-      keyword,
-      count: jobs.length,
-      jobs,
-    };
-  } finally {
-    await browser.close();
+    if (jobs.length >= cap) break;
   }
-}
 
-// Moka 岗位 → 看板投递记录
-function mokaToApplication(job, { company, url }) {
-  const notes = [job.team ? `部门 ${job.team}` : '', job.date ? `发布 ${job.date}` : '']
-    .filter(Boolean)
-    .join(' | ');
   return {
-    company,
-    title: job.title,
-    channel: '官网',
-    url: job.detailUrl || url,
-    status: 'pending',
-    source: 'mokahr.com',
-    degree: '',
-    industry: '',
-    jd: '',
-    notes,
+    company: fallbackName || org,
+    url: portalUrl,
+    section,
+    keyword,
+    count: jobs.length,
+    jobs,
   };
 }
 
-module.exports = { scrapeMoka, mokaToApplication, parseMokaCard };
+module.exports = { scrapeMoka, parseInitData, decryptMoka };

@@ -1,28 +1,31 @@
 'use strict';
 
 /**
- * 求职星计划 — 字节跳动 jobs.bytedance.com 抓取（适配器 #2）
+ * 求职星计划 — 飞书 ATSX 招聘后端适配器（纯 HTTP 直连版）
+ * 覆盖：字节跳动、小米、商汤、得物（同一飞书 ATSX 后端，仅 host + portal-channel 不同）
  *
- * 岗位列表 API（/api/v1/search/job/posts）有签名/CSRF 校验，直连 405。
- * 方案：Puppeteer 加载页面，**拦截页面自身发出的 API 响应**（自带合法签名），
- * 通过滚动触发翻页，累积所有批次数据。每条含完整 JD/要求/城市/发布日期。
+ * 机制（参考 job-pro 的 feishu.ts，已实测验证）：
+ *   POST https://<host>/api/v1/search/job/posts
+ *   必须 header：portal-channel + website-path（= channel）+ portal-platform: pc
+ *   body：keyword/limit/offset/portal_type:3/portal_entrance:1/language:zh + recruitment_id_list
+ *   recruitment_id_list：["201"]=校招应届、["202"]=实习
+ *   响应：{code:0, data:{job_post_list, count}}（code===0 成功）
+ *
+ * 相比旧浏览器拦截（签名/CSRF 405）的改进：直连无需签名破解、无需浏览器、秒级返回。
  */
 
-let puppeteer;
-try {
-  puppeteer = require('puppeteer-core');
-} catch {
-  puppeteer = require('../job-hunter/node_modules/puppeteer-core');
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const DEFAULT_BASE = 'https://jobs.bytedance.com';
+
+function hostOf(base) {
+  return String(base || DEFAULT_BASE).replace(/^https?:\/\//, '').replace(/\/+$/, '');
 }
 
-const EDGE_PATH = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const BASE = 'https://jobs.bytedance.com';
-
-// 版块 → 页面路径（默认字节；同 ATS 的其他公司可传 base/campusPath/socialPath 覆盖）
-function sectionUrl(base, section, { campusPath, socialPath } = {}) {
-  const b = String(base || BASE).replace(/\/+$/, '');
-  if (section === 'social') return socialPath ? b + socialPath : `${b}/experienced/position`;
-  return campusPath ? b + campusPath : `${b}/campus/position`;
+// 从 campusPath/socialPath 提取 portal-channel 值（如 /campus/ → campus，/578078/position/ → 578078，/edu/ → edu）
+function channelOf(path, fallback) {
+  if (!path) return fallback;
+  const m = String(path).match(/^\/([^/]+)/);
+  return m ? m[1] : fallback;
 }
 
 function fmtDate(epochMs) {
@@ -35,13 +38,16 @@ function fmtDate(epochMs) {
 // API 岗位记录 → 统一岗位结构
 // 注意：detail 链接用 jp.id（长数字），不是 jp.code；路径用 campusPath（如商汤 /edu），不是硬编码 /campus
 function mapJobPost(jp, section, base, campusPath) {
-  const b = String(base || BASE).replace(/\/+$/, '');
+  const b = String(base || DEFAULT_BASE).replace(/\/+$/, '');
   const title = String(jp.title || '');
   // 只有「标题 - 团队」这种带空格的才拆；「中国区-研发工程师」不拆
   const tm = title.match(/^(.+?)\s+-\s+(.+)$/);
   const cities = (jp.city_list || []).map((c) => c.name).filter(Boolean);
   const campusBase = campusPath ? String(campusPath).replace(/\/+$/, '') : '/campus';
-  const detailBase = section === 'social' ? `${b}/experienced/position` : `${b}${campusBase}/position`;
+  // campusPath 已含 /position（如得物 /578078/position/）则不再补，否则补 /position
+  const detailBase = section === 'social'
+    ? `${b}/experienced/position`
+    : (campusBase.endsWith('/position') ? `${b}${campusBase}` : `${b}${campusBase}/position`);
   const jobId = String(jp.id || jp.code || '');
   return {
     id: jobId,
@@ -49,6 +55,7 @@ function mapJobPost(jp, section, base, campusPath) {
     team: tm ? tm[2].trim() : '',
     location: cities.join('、'),
     type: (jp.recruit_type && jp.recruit_type.name) || '',
+    section: (() => { const n = (jp.recruit_type && jp.recruit_type.name) || ''; return /实习/.test(n) ? 'intern' : /社招/.test(n) ? 'social' : 'campus'; })(),
     category: (jp.job_category && jp.job_category.name) || '',
     program: (jp.job_subject && jp.job_subject.name && jp.job_subject.name.zh_cn) || '',
     date: fmtDate(jp.publish_time),
@@ -57,139 +64,81 @@ function mapJobPost(jp, section, base, campusPath) {
   };
 }
 
-/**
- * 抓取字节招聘岗位
- * @param {string} section campus | social | intern
- * @param {string} keyword 可选关键词
- * @param {number} maxJobs 目标条数上限（滚动翻页累积，默认 100）
- */
-async function scrapeByteDance({ section = 'campus', keyword = '', maxJobs = 100, base, campusPath, socialPath } = {}) {
-  const url = sectionUrl(base, section, { campusPath, socialPath });
-  const cap = Math.min(Math.max(Number(maxJobs) || 100, 10), 500);
-  const keywords = Array.isArray(keyword) ? keyword : (keyword ? [keyword] : ['']);
-
-  const browser = await puppeteer.launch({
-    executablePath: EDGE_PATH,
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-gpu', '--no-proxy-server'],
+// 单页搜索（直连飞书 ATSX）
+async function searchPage(host, channel, { keyword, limit, offset, recruitmentIdList }) {
+  const body = { keyword: keyword || '', limit, offset, portal_type: 3, portal_entrance: 1, language: 'zh' };
+  if (recruitmentIdList && recruitmentIdList.length) body.recruitment_id_list = recruitmentIdList;
+  const res = await fetch(`https://${host}/api/v1/search/job/posts`, {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'application/json',
+      'portal-channel': channel,
+      'portal-platform': 'pc',
+      'website-path': channel,
+      Referer: `https://${host}/${channel}/position`,
+    },
+    body: JSON.stringify(body),
   });
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-    );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const j = await res.json().catch(() => null);
+  if (!j || j.code !== 0) throw new Error(`上游 code ${j && j.code}: ${j && j.message}`);
+  return j.data || { job_post_list: [], count: 0 };
+}
 
-    // 拦截页面自身发出的岗位搜索响应（无需重放 API）
-    let currentEnc = ''; // 当前搜索关键词（URL 编码），只收该关键词的响应
-    const batches = [];
-    page.on('response', (res) => {
-      const u = res.url();
-      if (!u.includes('/api/v1/search/job/posts')) return;
-      // 关键词模式下只收命中当前关键词的响应，避免混入未过滤的首屏数据
-      if (currentEnc && !u.includes(`keyword=${currentEnc}`)) return;
-      if (res.status() !== 200) return;
-      res
-        .text()
-        .then((text) => {
-          try {
-            const j = JSON.parse(text);
-            if (j && j.data && Array.isArray(j.data.job_post_list)) batches.push(j.data);
-          } catch { /* 跳过无法解析的响应 */ }
-        })
-        .catch(() => {});
-    });
+/**
+ * 抓取飞书 ATSX 招聘岗位（纯 HTTP）
+ * @param {string} section campus | social | intern
+ * @param {string|string[]} keyword 关键词（字符串或数组）
+ * @param {number} maxJobs 目标条数上限
+ * @param {string} base 站点基地址（如 https://jobs.bytedance.com）
+ * @param {string} campusPath 校招路径（如 /campus/、/edu/、/578078/position/）
+ * @param {string} socialPath 社招路径
+ */
+async function scrapeByteDance({ section = 'campus', keyword = '', maxJobs = 100, base, campusPath, socialPath, fallbackName = '字节跳动' } = {}) {
+  const b = String(base || DEFAULT_BASE).replace(/\/+$/, '');
+  const host = hostOf(b);
+  const cap = Math.min(Math.max(Number(maxJobs) || 100, 10), 500);
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    await new Promise((r) => setTimeout(r, 8000)); // 等首屏与首次 API 完成
+  // 确定 channel（portal-channel header 值）。section 只决定校招/社招路径，不带 recruitment_id_list（一次抓全量，section 从岗位 recruit_type 字段判断）
+  const channel = section === 'social' ? channelOf(socialPath, 'experienced') : channelOf(campusPath, 'campus');
 
-    const seen = new Set();
-    const jobs = [];
-    let totalOnSite = 0;
+  const keywords = Array.isArray(keyword) ? keyword : (keyword ? [keyword] : ['']);
+  const seen = new Set();
+  const jobs = [];
+  const pageSize = 100;
+  let totalOnSite = 0;
 
-    for (const kw of keywords) {
-      currentEnc = kw ? encodeURIComponent(kw) : '';
-      batches.length = 0; // 每个关键词重置响应缓存
-
-      if (kw) {
-        // 搜索框可能渲染较慢（得物等站点并发抓取时尤甚），用 waitForSelector 兜底等待
-        try {
-          await page.waitForSelector('input[placeholder*="搜索"]', { timeout: 12000 });
-        } catch {
-          throw new Error('关键词搜索未能生效（搜索框未找到）');
-        }
-        const ok = await page.evaluate(async (kw) => {
-          const input = document.querySelector('input[placeholder*="搜索"]');
-          if (!input) return false;
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          input.focus();
-          setter.call(input, kw);
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          const opts = { key: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-          input.dispatchEvent(new KeyboardEvent('keydown', opts));
-          input.dispatchEvent(new KeyboardEvent('keyup', opts));
-          await new Promise((r) => setTimeout(r, 3000));
-          return true;
-        }, kw);
-        if (!ok) throw new Error('关键词搜索未能生效（搜索框未找到）');
-
-        // 等命中关键词的搜索结果被拦截（0 结果也会 push 一个空列表）
-        let applied = false;
-        for (let i = 0; i < 8 && !applied; i++) {
-          await new Promise((r) => setTimeout(r, 1000));
-          applied = batches.length > 0;
-        }
-        if (!applied) continue; // 该关键词无结果，跳下一个
+  for (const kw of keywords) {
+    let total = 0;
+    for (let offset = 0; ; offset += pageSize) {
+      const data = await searchPage(host, channel, { keyword: kw, limit: pageSize, offset });
+      if (offset === 0) { total = data.count || 0; if (!totalOnSite) totalOnSite = total; }
+      const list = data.job_post_list || [];
+      for (const jp of list) {
+        const id = String(jp.id || '');
+        if (id && !seen.has(id)) { seen.add(id); jobs.push(mapJobPost(jp, section, b, campusPath)); }
       }
-
-      // 逐页点击「下一页」，累积拦截到的 API 响应（每页 10 条）
-      let idleRounds = 0;
-      const maxRounds = Math.ceil(cap / 10) + 5;
-      for (let i = 0; i < maxRounds; i++) {
-        const before = jobs.length;
-        for (const b of batches) {
-          for (const jp of b.job_post_list || []) {
-            if (seen.has(jp.id)) continue;
-            seen.add(jp.id);
-            jobs.push(mapJobPost(jp, section, base, campusPath));
-          }
-        }
-        if (jobs.length >= cap) break;
-
-        const clicked = await page.evaluate(() => {
-          const next = document.querySelector('[class*="pagination-next"], [title="下一页"], [aria-label="下一页"]');
-          if (next && !/disabled/i.test(next.className || '')) {
-            next.click();
-            return true;
-          }
-          return false;
-        });
-        if (!clicked) break;
-        await new Promise((r) => setTimeout(r, 2000));
-
-        if (jobs.length === before) {
-          idleRounds++;
-          if (idleRounds >= 3) break;
-        } else {
-          idleRounds = 0;
-        }
-      }
-
-      if (totalOnSite === 0 && batches.length) totalOnSite = batches[0].count || 0;
-      if (jobs.length >= cap) break;
+      if (list.length < pageSize) break;      // 本页不满 → 到底
+      if (jobs.length >= cap) break;          // 到上限
+      if (total && offset + pageSize >= total) break; // 已拉满
     }
-
-    return {
-      company: '字节跳动',
-      url,
-      section,
-      keyword,
-      totalOnSite,
-      count: jobs.length,
-      jobs,
-    };
-  } finally {
-    await browser.close();
+    if (jobs.length >= cap) break;
   }
+
+  const url = section === 'social'
+    ? `${b}${socialPath || '/experienced/position'}`
+    : `${b}${campusPath || '/campus/position'}`;
+  return {
+    company: fallbackName,
+    url,
+    section,
+    keyword,
+    totalOnSite,
+    count: jobs.length,
+    jobs,
+  };
 }
 
 // 字节岗位 → 看板投递记录

@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "求职星 · 自动填充",
+  "version": "0.1.0",
+  "description": "校招/社招网申投递表单自动填充（不自动提交）",
+  "permissions": ["activeTab", "storage", "scripting", "sidePanel"],
+  "host_permissions": ["http://localhost:8630/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "求职星"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["autofill-core.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["avatar.svg"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

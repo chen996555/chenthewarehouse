@@ -13,3 +13,19 @@ node_modules/
 # 参考/其他项目：不随本仓库提交（各自独立仓库）
 BossHunter/
 job-hunter/
+
+# 敏感数据（密钥/简历/缓存/画像/备份）：不提交
+tracker/data/scorer-config.json
+tracker/data/jobs-cache.json
+tracker/data/profile.parsed.json
+tracker/data/resume-files/
+tracker/data/test-resumes/
+tracker/data/backups/
+tracker/data/edge-debug/
+
+# 调试抓取产物（接口响应/网络数据/HAR 抓包，可能含敏感信息）：不提交
+*.har
+tracker/*_di.json
+tracker/*_dom.json
+tracker/*_network.json
+tracker/*_form_api.json

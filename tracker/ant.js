@@ -1,138 +1,78 @@
 'use strict';
 
 /**
- * 求职星计划 — 蚂蚁集团 talent.antgroup.com 适配器（适配器 #13，Puppeteer 页面上下文调用）
- *
- * 岗位 API：POST hrcareersweb.antgroup.com/api/campus/position/search?ctoken={token}
- * ctoken 由页面生成，需在浏览器页面上下文里调用（自动带 cookie + token）。
+ * 求职星计划 — 蚂蚁集团 适配器（纯 HTTP）
+ * 参考 job-pro antgroup.ts（原误判为浏览器型需 ctoken，实为纯 HTTP 匿名）。
+ * POST https://hrcareersweb.antgroup.com/api/campus/position/search
+ *   body：{ key, pageIndex, pageSize, language:"zh" }
+ * 响应：{ success:true, errorMsg:"成功", content:[...], totalCount }
+ * 字段：id/name(title)/department/description/requirement/workLocations/positionType
+ * 坑：pageSize 上限 49（50 返回 success:false 系统繁忙）
  */
 
-let puppeteer;
-try {
-  puppeteer = require('puppeteer-core');
-} catch {
-  puppeteer = require('../job-hunter/node_modules/puppeteer-core');
-}
+const API_ROOT = 'https://hrcareersweb.antgroup.com/api';
+const CAMPUS_PAGE = 'https://talent.antgroup.com/campus-list';
+const MAX_PAGE_SIZE = 49;
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
 
-const EDGE_PATH = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const BASE = 'https://talent.antgroup.com';
-
-function fmtDate(iso) {
-  return String(iso || '').slice(0, 10);
+async function fetchAntPage({ keyword, pageIndex, pageSize }) {
+  const body = { key: keyword || '', pageIndex, pageSize, language: 'zh' };
+  const res = await fetch(`${API_ROOT}/campus/position/search`, {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Content-Type': 'application/json;charset=UTF-8',
+      Origin: 'https://talent.antgroup.com',
+      Referer: CAMPUS_PAGE,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`蚂蚁 HTTP ${res.status}`);
+  const j = await res.json().catch(() => null);
+  if (!j || j.success !== true) return { content: [], totalCount: 0 };
+  return { content: j.content || [], totalCount: Number(j.totalCount || 0) };
 }
 
 function mapAntJob(item) {
-  const grad = item.graduationTime || {};
+  const id = String(item.id || item.code || '');
+  const locs = Array.isArray(item.workLocations) ? item.workLocations.filter(Boolean).join(' / ') : '';
   return {
-    id: String(item.id || ''),
-    title: item.name || '',
-    team: '',
-    location: '',
-    type: '',
-    category: item.categories || '',
-    program: grad.from ? `${fmtDate(grad.from).slice(0, 4)}-${fmtDate(grad.to).slice(0, 4)}届` : '',
-    date: fmtDate(item.publishTime),
-    detailUrl: item.positionUrl || `${BASE}/campus-full-list`,
-    jd: '',
+    id,
+    title: String(item.name || '').trim(),
+    team: String(item.department || '').trim(),
+    location: locs,
+    type: String(item.positionType || '').trim(),
+    section: /实习/.test(item.positionType || '') ? 'intern' : 'campus',
+    program: item.project || item.categoryName || '',
+    date: '',
+    detailUrl: id ? `https://talent.antgroup.com/campus-position?positionId=${id}` : CAMPUS_PAGE,
+    jd: [item.description, item.requirement].filter(Boolean).join('\n'),
   };
 }
 
 async function scrapeAnt({ keyword = '', maxJobs = 100, fallbackName = '蚂蚁集团' } = {}) {
-  const cap = Math.min(Math.max(Number(maxJobs) || 100, 10), 300);
-  const keywords = Array.isArray(keyword) ? keyword : (keyword ? [keyword] : ['']);
+  const cap = Math.min(Math.max(Number(maxJobs) || 100, 10), 500);
+  const pageSize = MAX_PAGE_SIZE;
+  const seen = new Set();
+  const jobs = [];
+  let total = 0;
 
-  const browser = await puppeteer.launch({
-    executablePath: EDGE_PATH,
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-gpu', '--no-proxy-server'],
-  });
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-    );
-
-    // 捕获页面生成的 ctoken
-    let token = '';
-    page.on('request', (req) => {
-      const m = req.url().match(/ctoken=([A-Za-z0-9_]+)/);
-      if (m && !token) token = m[1];
-    });
-
-    await page.goto(`${BASE}/campus-full-list`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await new Promise((r) => setTimeout(r, 9000));
-    if (!token) throw new Error('未捕获到蚂蚁 ctoken');
-
-    // 页面上下文循环关键词 + 翻页拉取（自动携带 cookie）；key = 关键词搜索字段（阿里系同款）
-    const items = await page.evaluate(async (token, keywords) => {
-      const all = [];
-      const seen = new Set();
-      for (const kw of keywords) {
-        for (let i = 1; i <= 30; i++) {
-          const res = await fetch(`https://hrcareersweb.antgroup.com/api/campus/position/search?ctoken=${token}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              channel: 'campus_group_official_site', language: 'zh', regions: '', subCategories: '',
-              bgCode: '', pageIndex: i, pageSize: 20, recruitType: [], batchIds: [], key: kw || '',
-            }),
-          });
-          const j = await res.json();
-          if (!j || !j.success || !Array.isArray(j.content) || !j.content.length) break;
-          for (const it of j.content) {
-            const id = String(it.id);
-            if (seen.has(id)) continue;
-            seen.add(id);
-            all.push(it);
-          }
-          if (j.content.length < 20) break;
-        }
-      }
-      return all;
-    }, token, keywords);
-
-    const seen = new Set();
-    const jobs = [];
-    for (const it of items) {
-      const id = String(it.id);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      jobs.push(mapAntJob(it));
-      if (jobs.length >= cap) break;
+  for (let pageIndex = 1; jobs.length < cap; pageIndex++) {
+    const { content, totalCount } = await fetchAntPage({ keyword, pageIndex, pageSize });
+    if (pageIndex === 1) total = totalCount;
+    const list = content || [];
+    if (!list.length) break;
+    for (const it of list) {
+      const id = String(it.id || it.code || '');
+      if (id && !seen.has(id)) { seen.add(id); jobs.push(mapAntJob(it)); }
     }
-
-    return {
-      company: fallbackName,
-      url: `${BASE}/campus-full-list`,
-      section: 'campus',
-      keyword,
-      totalOnSite: items.length,
-      count: jobs.length,
-      jobs,
-    };
-  } finally {
-    await browser.close();
+    if (list.length < pageSize) break;
+    if (total && pageIndex * pageSize >= total) break;
   }
+
+  return { company: fallbackName, url: CAMPUS_PAGE, section: 'campus', keyword, totalOnSite: total, count: jobs.length, jobs };
 }
 
-function antToApplication(job, { company, url }) {
-  const notes = [
-    job.program || '',
-    job.category ? `类别 ${job.category}` : '',
-    job.date ? `发布 ${job.date}` : '',
-  ].filter(Boolean).join(' | ');
-  return {
-    company,
-    title: job.title,
-    channel: '官网',
-    url: job.detailUrl || url,
-    status: 'pending',
-    source: 'antgroup.com',
-    degree: '',
-    industry: '',
-    jd: '',
-    notes,
-  };
-}
-
-module.exports = { scrapeAnt, antToApplication, mapAntJob };
+module.exports = { scrapeAnt, mapAntJob };

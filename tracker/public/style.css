@@ -193,3 +193,5 @@ main { padding: 16px 20px; }
 }
 .card:hover .card-link { display: block; }
 .card-link:hover { color: var(--primary); background: #eff6ff; }
+.card-link.apply-link { display: block; color: var(--primary); font-weight: 600; }
+.card-link.apply-link:hover { background: var(--primary); color: #fff; }

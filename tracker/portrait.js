@@ -27,8 +27,8 @@ function loadLlmConfig() {
   };
 }
 
-function loadProfile() {
-  return JSON.parse(fs.readFileSync(PROFILE_PATH, 'utf8'));
+function loadProfile(profilePath = PROFILE_PATH) {
+  return JSON.parse(fs.readFileSync(profilePath, 'utf8'));
 }
 
 function buildPrompt(profile) {
@@ -53,6 +53,7 @@ ${work}
 
 要求：
 - keywords：12-18 个搜索关键词，严格依据简历中的实习经历、教育背景、技能生成，仅覆盖简历能匹配的岗位方向，按相关度排序，宁多勿漏。
+- keywords 只用「岗位方向词」（如：采购、招标、供应链、寻源、品类、采销、履约、降本），严禁用「方向+职位」复合词（如：采购实习生、供应链实习生、采购助理）——复合词会被招聘系统拆词，导致「实习生/助理」单独命中大量无关岗位稀释精度。
 - directions：3-5 个目标方向描述，比 keywords 更具体（体现行业/岗位方向）。
 - 严禁臆测：简历中没有经历支撑的方向（如采购、供应链、招投标）一律不要输出，不要因专业名称（如国际商务）就推断无关岗位方向。`;
 }
@@ -64,10 +65,10 @@ function parseJsonLoose(text) {
   try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
 }
 
-async function generate() {
+async function generate(profilePath = PROFILE_PATH) {
   const cfg = loadLlmConfig();
   if (!cfg.apiKey) throw new Error('缺少 DEEPSEEK_API_KEY（环境变量或 scorer-config.json）');
-  const profile = loadProfile();
+  const profile = loadProfile(profilePath);
 
   const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -93,7 +94,7 @@ async function generate() {
     directions: (portrait.directions || []).map((d) => String(d).trim()).filter(Boolean),
     generated_at: new Date().toISOString(),
   };
-  fs.writeFileSync(PROFILE_PATH, JSON.stringify(profile, null, 2), 'utf8');
+  fs.writeFileSync(profilePath, JSON.stringify(profile, null, 2), 'utf8');
 
   console.log('搜索画像已生成，写入 job_search.search_portrait：');
   console.log(JSON.stringify(profile.job_search.search_portrait, null, 2));

@@ -30,9 +30,12 @@ const ne = require('./ne');
 const scorer = require('./scorer');
 const companies = require('./companies');
 const scan = require('./scan');
+const resumeParse = require('./resume_parse');
+const portrait = require('./portrait');
 
 const PORT = process.env.PORT || 8630;
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const INVITE_CODE = process.env.INVITE_CODE || 'JOBSTAR2027'; // 邀请码（内测用，环境变量可覆盖）
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -50,6 +53,9 @@ function send(res, code, data) {
   const body = isText ? data : JSON.stringify(data);
   res.writeHead(code, {
     'Content-Type': isText ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   });
   res.end(body);
 }
@@ -68,6 +74,20 @@ function readBody(req) {
     });
     req.on('error', reject);
   });
+}
+
+// ---- 限流（简单固定窗口，内存；上云后可换 Redis 滑动窗口）----------------------
+const rateBuckets = new Map();
+function checkRateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  const b = rateBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+  if (now > b.resetAt) { b.count = 0; b.resetAt = now + windowMs; }
+  b.count++;
+  rateBuckets.set(key, b);
+  return b.count <= limit;
+}
+function clientIp(req) {
+  return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
 // ---- 静态文件 ---------------------------------------------------------------
@@ -96,7 +116,144 @@ const scanTasks = new Map();
 
 async function handleApi(req, res, pathname, searchParams = new URLSearchParams()) {
   const db = dbApi.getDb();
+  const _start = Date.now();
   try {
+    // 鉴权：从 Authorization: Bearer <token> 解析用户
+    const authUser = () => {
+      const token = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+      return token ? dbApi.getUserByToken(db, token) : null;
+    };
+
+    // POST /api/register —— 注册（需邀请码）
+    if (req.method === 'POST' && pathname === '/api/register') {
+      if (!checkRateLimit('register:' + clientIp(req), 10, 60000)) return send(res, 429, { error: '请求过于频繁，请稍后再试' });
+      const body = await readBody(req);
+      if (String(body.inviteCode || '') !== INVITE_CODE) return send(res, 403, { error: '邀请码错误' });
+      const user = dbApi.createUser(db, { username: body.username, password: body.password });
+      return send(res, 201, user);
+    }
+
+    // POST /api/login —— 登录
+    if (req.method === 'POST' && pathname === '/api/login') {
+      if (!checkRateLimit('login:' + clientIp(req), 10, 60000)) return send(res, 429, { error: '请求过于频繁，请稍后再试' });
+      const body = await readBody(req);
+      const user = dbApi.loginUser(db, { username: body.username, password: body.password });
+      return send(res, 200, user);
+    }
+
+    // POST /api/resume/parse —— 简历文本 → LLM 结构化画像（带 token 则存用户画像）
+    if (req.method === 'POST' && pathname === '/api/resume/parse') {
+      const body = await readBody(req);
+      const text = String(body.resumeText || body.text || '').trim();
+      if (!text) return send(res, 400, { error: '缺少 resumeText（简历文本）' });
+      const parsed = await resumeParse.llmParseProfile(text);
+      const profile = { meta: { owner: (parsed.identity && parsed.identity.legal_name) || '', updated: new Date().toISOString().slice(0, 10) }, ...parsed };
+      const user = authUser();
+      if (user) dbApi.updateUserProfile(db, user.id, profile);
+      return send(res, 200, { profile });
+    }
+
+    // POST /api/resume/parse-file —— 上传简历文件（pdf/txt，base64）→ LLM 画像 + 存原始文件（供官网简历上传）
+    if (req.method === 'POST' && pathname === '/api/resume/parse-file') {
+      const body = await readBody(req);
+      const fileName = String(body.fileName || 'resume.pdf');
+      const fileData = body.fileData;
+      if (!fileData) return send(res, 400, { error: '缺少 fileData（base64）' });
+      const ext = (path.extname(fileName) || '.pdf').toLowerCase();
+      const tmpFile = path.join(__dirname, 'data', `upload-${Date.now()}${ext}`);
+      fs.writeFileSync(tmpFile, Buffer.from(fileData, 'base64'));
+      try {
+        const text = await resumeParse.extractText(tmpFile);
+        const parsed = await resumeParse.llmParseProfile(text);
+        const profile = { meta: { owner: (parsed.identity && parsed.identity.legal_name) || '', updated: new Date().toISOString().slice(0, 10) }, ...parsed };
+        const user = authUser();
+        if (user) dbApi.updateUserProfile(db, user.id, profile);
+        // 保存原始简历文件（供「上传简历到官网」四两拨千斤），按用户隔离
+        const uid = user ? user.id : 'anonymous';
+        const resumeDir = path.join(__dirname, 'data', 'resume-files');
+        fs.mkdirSync(resumeDir, { recursive: true });
+        fs.copyFileSync(tmpFile, path.join(resumeDir, `${uid}${ext}`));
+        return send(res, 200, { profile, textLength: text.length, resumeFileName: `${uid}${ext}` });
+      } finally {
+        try { fs.unlinkSync(tmpFile); } catch {}
+      }
+    }
+
+    // GET /api/resume/file —— 返回用户简历文件 base64（扩展「上传简历到官网」用）
+    if (req.method === 'GET' && pathname === '/api/resume/file') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      const resumeDir = path.join(__dirname, 'data', 'resume-files');
+      let file = null;
+      try {
+        const files = fs.readdirSync(resumeDir).filter((f) => f.startsWith(String(user.id) + '.'));
+        if (files.length) file = files[0];
+      } catch {}
+      if (!file) return send(res, 404, { error: '没有保存的简历文件，请先上传简历' });
+      const ext = path.extname(file).toLowerCase();
+      const mimeType = { '.pdf': 'application/pdf', '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.txt': 'text/plain' }[ext] || 'application/octet-stream';
+      return send(res, 200, { fileName: file, fileData: fs.readFileSync(path.join(resumeDir, file)).toString('base64'), mimeType });
+    }
+
+    // POST /api/resume/tailor —— 简历针对性优化（JD ↔ 简历匹配 + 定制建议）
+    if (req.method === 'POST' && pathname === '/api/resume/tailor') {
+      const body = await readBody(req);
+      const jd = String(body.jd || '').trim();
+      if (!jd) return send(res, 400, { error: '缺少 jd（岗位描述）' });
+      const user = authUser();
+      const savedProfile = user ? dbApi.getUserProfile(db, user.id) : null;
+      const profile = (savedProfile && savedProfile.identity) ? savedProfile : body.profile;
+      if (!profile || !profile.identity) return send(res, 400, { error: '缺少 profile（画像）' });
+      const tailored = await resumeParse.llmTailorResume(jd, profile);
+      return send(res, 200, tailored);
+    }
+
+    // GET /api/me —— 查询当前用户信息
+    if (req.method === 'GET' && pathname === '/api/me') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      return send(res, 200, { username: user.username });
+    }
+
+    // POST /api/recommend —— 画像 → 扫描+打分 → 推荐清单（异步任务，轮询 /api/scan/status）
+    if (req.method === 'POST' && pathname === '/api/recommend') {
+      if (!checkRateLimit('recommend:' + clientIp(req), 5, 60000)) return send(res, 429, { error: '推荐请求过于频繁，请稍后再试' });
+      const body = await readBody(req);
+      const user = authUser();
+      const savedProfile = user ? dbApi.getUserProfile(db, user.id) : null;
+      const profile = (savedProfile && savedProfile.identity) ? savedProfile : body.profile;
+      if (!profile || !profile.identity) return send(res, 400, { error: '缺少 profile（画像）' });
+      // 单用户 MVP：画像写回 data/profile.json，再跑 portrait + scan
+      fs.writeFileSync(path.join(__dirname, 'data', 'profile.json'), JSON.stringify(profile, null, 2), 'utf8');
+      const jobId = String(Date.now()).slice(-8) + Math.floor(Math.random() * 1000);
+      scanTasks.set(jobId, { status: 'running', progress: '生成搜索画像…', live: [] });
+      (async () => {
+        try {
+          await portrait.generate();
+          scanTasks.set(jobId, { status: 'running', progress: '扫描岗位并打分…', live: [] });
+          const result = await scan.scanAll({
+            section: body.section || 'campus',
+            importToBoard: body.importToBoard !== false,
+            userId: user ? String(user.id) : '',
+            mode: body.mode || 'precise', // broad 海投 / precise 精投
+            onProgress: (msg) => {
+              const t = scanTasks.get(jobId) || { live: [] };
+              scanTasks.set(jobId, { status: 'running', progress: msg, live: t.live || [] });
+            },
+            onLive: (jobs) => {
+              const t = scanTasks.get(jobId) || { live: [] };
+              scanTasks.set(jobId, { status: 'running', progress: t.progress, live: (t.live || []).concat(jobs) });
+            },
+          });
+          const t = scanTasks.get(jobId) || { live: [] };
+          scanTasks.set(jobId, { status: 'done', result, live: t.live || [] });
+        } catch (e) {
+          scanTasks.set(jobId, { status: 'error', error: e.message });
+        }
+      })();
+      return send(res, 202, { jobId });
+    }
+
     // GET /api/meta —— 状态机与渠道定义
     if (req.method === 'GET' && pathname === '/api/meta') {
       return send(res, 200, {
@@ -128,6 +285,8 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     // POST /api/import —— 把搜索到的岗位导入「待投」列（去重）
     if (req.method === 'POST' && pathname === '/api/import') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const result = dbApi.importApplication(db, search.jobToApplication(body));
       return send(res, result.created ? 201 : 200, result);
@@ -135,6 +294,8 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     // POST /api/scrape-zhiye —— 抓取某公司官网真实在招岗位（耗时约 10-20 秒）
     if (req.method === 'POST' && pathname === '/api/scrape-zhiye') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const result = await zhiye.scrapeZhiye(body);
       return send(res, 200, result);
@@ -142,6 +303,8 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     // POST /api/import-zhiye —— 把官网抓到的岗位导入「待投」列（去重）
     if (req.method === 'POST' && pathname === '/api/import-zhiye') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const input = zhiye.zhiyeToApplication(body.job, { company: body.company, url: body.url });
       const result = dbApi.importApplication(db, input);
@@ -155,6 +318,8 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     // POST /api/score —— 智能打分（异步任务）：返回 jobId，用 /api/score/status 轮询
     if (req.method === 'POST' && pathname === '/api/score') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const jobId = String(Date.now()).slice(-8) + Math.floor(Math.random() * 1000);
       scoreTasks.set(jobId, { status: 'running' });
@@ -175,6 +340,8 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     // POST /api/scan —— 一键扫描全部目标公司（异步任务），用 /api/scan/status 轮询
     if (req.method === 'POST' && pathname === '/api/scan') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const jobId = String(Date.now()).slice(-8) + Math.floor(Math.random() * 1000);
       scanTasks.set(jobId, { status: 'running', progress: '准备中…' });
@@ -194,11 +361,15 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       const jobId = searchParams.get('id') || '';
       const task = scanTasks.get(jobId);
       if (!task) return send(res, 404, { error: '任务不存在或已过期' });
-      return send(res, 200, task.status === 'running' ? { status: 'running', progress: task.progress } : task);
+      return send(res, 200, task.status === 'running'
+        ? { status: 'running', progress: task.progress, live: task.live || [] }
+        : task);
     }
 
     // POST /api/scrape —— 通用抓取：按公司名查注册表，分发到对应适配器
     if (req.method === 'POST' && pathname === '/api/scrape') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const company = companies.findCompany(body.name);
       if (!company) return send(res, 404, { error: '公司不在注册表中' });
@@ -289,6 +460,8 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     // POST /api/import-job —— 通用导入：按 adapter 把岗位映射为投递记录（去重）
     if (req.method === 'POST' && pathname === '/api/import-job') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const input = body.adapter === 'byte'
         ? byte.byteToApplication(body.job, { company: body.company, url: body.url })
@@ -325,25 +498,47 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       return send(res, result.created ? 201 : 200, result);
     }
 
-    // GET /api/stats —— 漏斗统计
+    // GET /api/stats —— 漏斗统计（需登录，按用户隔离）
     if (req.method === 'GET' && pathname === '/api/stats') {
-      return send(res, 200, dbApi.getStats(db));
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      return send(res, 200, dbApi.getStats(db, user.id));
     }
 
     // GET /api/activity —— 最近动态
     if (req.method === 'GET' && pathname === '/api/activity') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       return send(res, 200, dbApi.getActivity(db));
     }
 
-    // GET /api/applications —— 列表
+    // GET /api/applications —— 列表（附投递限制预警）
     if (req.method === 'GET' && pathname === '/api/applications') {
-      return send(res, 200, dbApi.listApplications(db));
+      const limits = require('./limits');
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      const apps = dbApi.listApplications(db, user.id).map((a) => ({
+        ...a,
+        applyLimit: limits.getApplyLimit(a.company),
+      }));
+      return send(res, 200, apps);
+    }
+
+    // POST /api/applications/mark-applied —— 「去投递」锚定：按 job_id 定位并标记已投（记 applied_at）
+    if (req.method === 'POST' && pathname === '/api/applications/mark-applied') {
+      const body = await readBody(req);
+      const user = authUser();
+      const app = dbApi.findByJobId(db, body.job_id, body.company, user ? user.id : '');
+      if (!app) return send(res, 404, { error: '岗位不在待投看板中（可能未导入或已投）' });
+      return send(res, 200, dbApi.updateApplication(db, app.id, { status: 'applied' }));
     }
 
     // POST /api/applications —— 新建
     if (req.method === 'POST' && pathname === '/api/applications') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
-      return send(res, 201, dbApi.createApplication(db, body));
+      return send(res, 201, dbApi.createApplication(db, { ...body, user_id: user.id }));
     }
 
     // /api/applications/:id —— 查 / 改 / 删
@@ -372,8 +567,10 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 
     send(res, 404, { error: '接口不存在' });
   } catch (e) {
+    require('./logger').error('API 错误', { method: req.method, path: pathname, error: e.message });
     send(res, 400, { error: e.message });
   } finally {
+    require('./logger').info('API 请求', { method: req.method, path: pathname, ms: Date.now() - _start });
     db.close();
   }
 }
@@ -381,6 +578,16 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
 // ---- 启动 -------------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
+  // CORS 预检：OPTIONS 请求直接返回，不带 body（扩展跨域调用必需）
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+    });
+    return res.end();
+  }
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname.startsWith('/api/')) {
     handleApi(req, res, url.pathname, url.searchParams).catch((e) => send(res, 500, { error: e.message }));

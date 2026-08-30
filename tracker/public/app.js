@@ -110,12 +110,18 @@ function renderCard(app) {
   if (app.salary) meta.push(`<span class="badge">${esc(app.salary)}</span>`);
   if (app.degree) meta.push(`<span class="badge">${esc(app.degree)}</span>`);
   if (app.industry) meta.push(`<span class="badge">${esc(app.industry)}</span>`);
+  if (app.score) meta.push(`<span class="badge src" title="匹配打分">${app.score}分${app.tier ? ' ' + app.tier + '档' : ''}</span>`);
+  if (app.applyLimit && app.applyLimit.note) meta.push(`<span class="badge overdue" title="${esc(app.applyLimit.note)}">⚠️ ${app.applyLimit.maxApplications ? '限投' + app.applyLimit.maxApplications + '次' : '限投'}</span>`);
   if (app.follow_up_date) {
     const overdue = app.follow_up_date < todayStr() && !['offer', 'rejected'].includes(app.status);
     meta.push(`<span class="badge ${overdue ? 'overdue' : ''}">⏰ ${esc(app.follow_up_date)}</span>`);
   }
 
-  const link = app.url ? `<a class="card-link" href="${esc(app.url)}" target="_blank" rel="noopener" title="打开官网投递页">↗</a>` : '';
+  const isPending = app.status === 'pending';
+  const link = app.url
+    ? `<a class="card-link${isPending ? ' apply-link' : ''}" href="${esc(app.url)}" target="_blank" rel="noopener"
+          data-apply="${app.id}" title="${isPending ? '去投递（自动标记为已投）' : '打开官网投递页'}">${isPending ? '投递 ↗' : '↗'}</a>`
+    : '';
 
   card.innerHTML = `
     <button class="del" title="删除" data-del="${app.id}">✕</button>
@@ -136,6 +142,14 @@ function renderCard(app) {
     if (!confirm(`删除「${app.company}｜${app.title}」这条投递记录？`)) return;
     try { await deleteApp(app.id); await refresh(); } catch (err) { alert(err.message); }
   });
+  // 「去投递」：pending 点击 = 标记已投 + 打开官网（只阻止冒泡，不 preventDefault，链接照常跳转）
+  const applyLink = card.querySelector('[data-apply]');
+  if (applyLink) {
+    applyLink.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try { await updateApp(app.id, { status: 'applied' }); await refresh(); } catch (err) { alert(err.message); }
+    });
+  }
   card.addEventListener('dragstart', (e) => {
     e.dataTransfer.setData('text/plain', app.id);
     e.dataTransfer.effectAllowed = 'move';

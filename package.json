@@ -1,0 +1,25 @@
+{
+  "name": "job-star",
+  "version": "1.0.0",
+  "description": "个人求职自动化系统，把「翻官网找岗位 → 判断该不该投 → 投递」这一整套流程自动化、半自动化。",
+  "main": "batch-search.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chen996555/chenthewarehouse.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/chen996555/chenthewarehouse/issues"
+  },
+  "homepage": "https://github.com/chen996555/chenthewarehouse#readme",
+  "dependencies": {
+    "mammoth": "^1.12.2",
+    "pdf-parse": "^2.4.5"
+  }
+}
