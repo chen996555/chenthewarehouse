@@ -29,3 +29,7 @@ tracker/*_di.json
 tracker/*_dom.json
 tracker/*_network.json
 tracker/*_form_api.json
+
+# 缓存 / 调试临时文件（JD 抽取缓存 + _ 前缀临时脚本/结果）：不提交
+tracker/data/jd-cache.json
+tracker/_*

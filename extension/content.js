@@ -2,7 +2,7 @@
 // content script：纯填表执行器（无 UI）
 // 接收 Side Panel 的 fill 命令，执行：上传简历 → 官网解析 → 规则兜底 → 报告未填字段
 (function () {
-  const { scanAndFill, uploadResumeFile } = window.JobStarAutofill;
+  const { scanAndFill, uploadResumeFile, collectUnmatched, applyMapping } = window.JobStarAutofill;
 
   function detectApplyForm() {
     const els = [...document.querySelectorAll('input, select, textarea')].filter((el) => el.type !== 'hidden' && el.offsetParent !== null);
@@ -45,7 +45,18 @@
     return unfilled;
   }
 
-  // 完整填表流程：① 上传简历让官网解析覆盖 → ② 规则匹配兜底 → ③ 报告未填字段
+  // 请求 Side Panel 调后端 LLM 做字段语义映射（content script 不能直连后端）
+  function requestFieldMapping(unmatched, keys) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ action: 'map-fields', signals: unmatched, keys }, (resp) => {
+          resolve((resp && resp.mapping) || []);
+        });
+      } catch { resolve([]); }
+    });
+  }
+
+  // 完整填表流程：① 上传简历让官网解析覆盖 → ② 规则匹配 → ③ LLM 语义兜底 → ④ 报告未填字段
   async function doFill(profile, resumeFile) {
     let uploadStatus = '';
     if (resumeFile && resumeFile.fileData) {
@@ -57,7 +68,17 @@
         uploadStatus = '简历上传失败：' + up.error;
       }
     }
-    const result = scanAndFill(profileToValues(profile));
+    const values = profileToValues(profile);
+    const result = scanAndFill(values); // ② 规则匹配
+    // ③ LLM 语义兜底：规则 miss 的字段，收集描述符（不含简历值）→ 后端映射 → 本地写值
+    try {
+      const unmatched = collectUnmatched();
+      if (unmatched.length) {
+        const mapping = await requestFieldMapping(unmatched, Object.keys(values));
+        const extra = applyMapping(values, mapping);
+        if (extra.length) result.written = result.written.concat(extra);
+      }
+    } catch (e) { /* LLM 兜底失败不影响规则填充 */ }
     const unfilled = scanUnfilled();
     return { written: result.written, unfilled, uploadStatus };
   }

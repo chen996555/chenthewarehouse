@@ -46,16 +46,17 @@ ${work}
 - 证书：${(bg.certificates || []).join('、')}
 - 技能：${(bg.skills || []).join('、')}
 - 经历摘要：${bg.experience_summary}
-- 手写目标方向（参考）：${(profile.job_search && profile.job_search.target_roles || []).join('、')}
+- 核心目标方向（keywords 必须围绕这些方向展开）：${(profile.job_search && profile.job_search.target_roles || []).join('、')}
 
 ## 任务：输出严格 JSON（不要 Markdown 代码块，不要解释）
 {"keywords":["岗位方向关键词A","岗位方向关键词B","岗位方向关键词C"],"directions":["具体目标方向A","具体目标方向B"]}
 
 要求：
-- keywords：12-18 个搜索关键词，严格依据简历中的实习经历、教育背景、技能生成，仅覆盖简历能匹配的岗位方向，按相关度排序，宁多勿漏。
-- keywords 只用「岗位方向词」（如：采购、招标、供应链、寻源、品类、采销、履约、降本），严禁用「方向+职位」复合词（如：采购实习生、供应链实习生、采购助理）——复合词会被招聘系统拆词，导致「实习生/助理」单独命中大量无关岗位稀释精度。
-- directions：3-5 个目标方向描述，比 keywords 更具体（体现行业/岗位方向）。
-- 严禁臆测：简历中没有经历支撑的方向（如采购、供应链、招投标）一律不要输出，不要因专业名称（如国际商务）就推断无关岗位方向。`;
+- keywords：12-18 个搜索关键词，**必须围绕上面的「核心目标方向」展开**（这是「想投的方向」，对应过往岗位的职能）；**不要从工作内容里的技能推断关键词**——过往岗位里用到的技能（如采购工作里的「数据分析」「AI」、市场工作里的「短视频」）是技能不是岗位方向，不要据此生成这类技能词；只提取与核心方向（岗位职能）直接相关的具体岗位方向词，严禁生成泛化能力词。
+- keywords 只用「岗位方向词」（如：Java、前端、产品、财务、供应链、采购等，据核心目标方向而定），严禁用「方向+职位」复合词（如：Java 实习生、前端助理）——复合词会被招聘系统拆词，导致「实习生/助理」单独命中大量无关岗位稀释精度。
+- 禁止「泛化能力词」：①动词（优化、管理、支持、提升、负责、跟进）②几乎所有岗位都通用的能力词——它们没有区分度，会导致推荐泛化到无关岗位；只保留能精准定位岗位方向的具体名词（职能/行业方向词）。
+- directions：3-5 个目标方向描述，比 keywords 更具体，**同样围绕核心目标方向**。
+- 严禁臆测：简历中没有经历支撑的方向一律不要输出，不要因专业名称就推断无关岗位方向。`;
 }
 
 function parseJsonLoose(text) {
@@ -65,10 +66,13 @@ function parseJsonLoose(text) {
   try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
 }
 
-async function generate(profilePath = PROFILE_PATH) {
+// 画像生成逻辑版本：改 buildPrompt 的规则时 +1，旧画像（version 不匹配）自动失效重新生成
+const SEARCH_PORTRAIT_VERSION = 'v2';
+
+// 核心：从 profile 对象生成 search_portrait（不读写文件，多用户隔离用）
+async function generatePortrait(profile) {
   const cfg = loadLlmConfig();
   if (!cfg.apiKey) throw new Error('缺少 DEEPSEEK_API_KEY（环境变量或 scorer-config.json）');
-  const profile = loadProfile(profilePath);
 
   const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -88,21 +92,35 @@ async function generate(profilePath = PROFILE_PATH) {
     throw new Error(`画像解析失败：${content.slice(0, 200)}`);
   }
 
-  profile.job_search = profile.job_search || {};
-  profile.job_search.search_portrait = {
+  return {
     keywords: portrait.keywords.map((k) => String(k).trim()).filter(Boolean),
     directions: (portrait.directions || []).map((d) => String(d).trim()).filter(Boolean),
     generated_at: new Date().toISOString(),
+    version: SEARCH_PORTRAIT_VERSION,
   };
+}
+
+// CLI 用：读文件 → 生成 → 写回文件
+async function generate(profilePath = PROFILE_PATH) {
+  const profile = loadProfile(profilePath);
+  const portrait = await generatePortrait(profile);
+
+  profile.job_search = profile.job_search || {};
+  profile.job_search.search_portrait = portrait;
   fs.writeFileSync(profilePath, JSON.stringify(profile, null, 2), 'utf8');
 
   console.log('搜索画像已生成，写入 job_search.search_portrait：');
-  console.log(JSON.stringify(profile.job_search.search_portrait, null, 2));
-  return profile.job_search.search_portrait;
+  console.log(JSON.stringify(portrait, null, 2));
+  return portrait;
+}
+
+// 多用户 API 用：从 profile 对象直接生成（不读写文件，避免全局文件污染）
+async function generateFromProfile(profile) {
+  return generatePortrait(profile);
 }
 
 if (require.main === module) {
   generate().catch((e) => { console.error('失败:', e.message); process.exit(1); });
 }
 
-module.exports = { generate, loadProfile };
+module.exports = { generate, generateFromProfile, loadProfile, SEARCH_PORTRAIT_VERSION };

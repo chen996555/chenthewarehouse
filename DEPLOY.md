@@ -37,23 +37,47 @@ DEEPSEEK_API_KEY=sk-xxx pm2 start server.js --name jobstar
 # 方式 3：pm2 ecosystem 配置文件
 ```
 
-## 四、HTTPS + 域名
+## 四、HTTPS + 域名（域名已定 jobaistar.ltd）
 
-1. 域名解析到服务器 IP
-2. Nginx 反向代理 + Let's Encrypt 证书：
+**当前状态（2026-08-30）**：域名 `jobaistar.ltd` 已在阿里云注册（NS=hichina，与服务器同家），已选**走 ICP 备案**（个人备案）。备案期间继续 `http://182.92.156.235:8630` 内测。
+
+### 第一步：ICP 备案（用户本人操作，约 7-20 工作日）
+
+前置：①域名实名认证（阿里云域名控制台，身份证，与备案主体一致）②服务器账号实名。
+
+流程：阿里云控制台 → ICP 备案 → 个人备案 → 填主体信息（姓名/身份证/手机号/地址）→ 填网站信息（域名 jobaistar.ltd、网站名称「求职星」）→ 传身份证正反面 + 人脸核验 → 阿里云初审（1-2 天）→ 短信核验 → 管局审核（7-20 天）。
+
+> 注意：**备案主体 = 域名实名 = 服务器账号，三者必须都是陈端发本人**。个人备案网站名称避免「招聘平台」这类经营性词汇，用「求职星」即可。
+
+### 第二步：备案通过后配 HTTPS（我来操作）
+
+1. **DNS 解析**：阿里云云解析 DNS，`jobaistar.ltd` 和 `www` 加 A 记录 → `182.92.156.235`
+2. **安全组**：开放 80、443 入方向
+3. **装 nginx**：`dnf install -y nginx`，systemctl 开机自启
+4. **SSL 证书**：阿里云免费 SSL 证书（单域名 1 年，自动续期）或 Let's Encrypt（certbot）
+5. **nginx 反代**：
 
 ```nginx
 server {
+  listen 80;
+  server_name jobaistar.ltd www.jobaistar.ltd;
+  return 301 https://$host$request_uri;   # 强制 HTTPS
+}
+server {
   listen 443 ssl;
-  server_name job.example.com;
-  ssl_certificate /etc/letsencrypt/live/job.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/job.example.com/privkey.pem;
+  server_name jobaistar.ltd www.jobaistar.ltd;
+  ssl_certificate /etc/letsencrypt/live/jobaistar.ltd/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/jobaistar.ltd/privkey.pem;
   location / {
     proxy_pass http://127.0.0.1:8630;
     proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
   }
 }
 ```
+
+6. **扩展切域名**（2 处）：manifest.json `host_permissions` → `https://jobaistar.ltd/*`；扩展「①简历」页「服务器地址」填 `https://jobaistar.ltd`
 
 ## 五、扩展端改 URL（2 处）
 
@@ -94,3 +118,24 @@ SQLite 单文件 `data/tracker.db`，定期备份：
 - [ ] 扩展「服务器地址」填公网域名
 - [ ] 配 crontab 备份
 - [x] rate limit + 结构化日志（已加）
+
+## 九、代码同步（日常改代码后）
+
+本地 Git Bash 执行（项目根目录 `job-star/`）：
+
+```bash
+bash sync.sh
+```
+
+`sync.sh` 自动三步：打包代码（**排除 data/node_modules/.git**）→ scp 上传 → 服务器解压 + `pm2 restart jobstar`。
+
+- 后端改动（tracker/）→ 自动重启生效
+- 前端改动（extension/）→ 本地重载扩展
+- **data 目录永不覆盖**（云端数据库/缓存/简历独立，与本地隔离）
+
+## 十、当前部署状态（2026-08-30）
+
+- ✅ 已部署：阿里云 ECS 182.92.156.235，pm2 开机自启，安全组 8630
+- ✅ 数据备份：crontab 每天凌晨 3 点（`backup.sh`）
+- ✅ 代码同步：`sync.sh` 一键
+- ⏸️ HTTPS：暂缓，内测用 http+IP+8630（有域名后再配 Nginx + SSL）

@@ -10,9 +10,10 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { classifyGroup } = require('./classify');
 
 function genConfig(c) {
-  const group = c.group || '互联网';
+  const group = c.group || classifyGroup(c.name);
   switch (c.ats) {
     case 'zhiye':
       return `  { group: '${group}', name: '${c.name}', adapter: 'zhiye', subdomain: '${c.subdomain}', path: 'campus/jobs' },`;
@@ -31,6 +32,11 @@ function genConfig(c) {
     }
     case 'wecruit':
       return `  { group: '${group}', name: '${c.name}', adapter: 'wecruit', suiteId: '${c.suiteId}', url: 'https://wecruit.hotjob.cn', reach: { type: 'direct', urlTemplate: 'https://wecruit.hotjob.cn/${c.suiteId}/pb/detail.html?postId={id}' } },`;
+    case 'hotjob': {
+      const suiteId = c.suiteId || '';
+      const base = c.base || 'https://wecruit.hotjob.cn';
+      return `  { group: '${group}', name: '${c.name}', adapter: 'hotjob', suiteId: '${suiteId}', base: '${base}', url: '${base}' },`;
+    }
     default:
       return null;
   }
@@ -58,6 +64,11 @@ async function verify(c) {
     if (c.ats === 'wecruit') {
       const w = require('./wecruit');
       const r = await w.scrapeWecruit({ suiteId: c.suiteId, section: c.section || 'campus', keyword: '', maxJobs: 1, fallbackName: c.name });
+      return (r && r.jobs && r.jobs.length > 0);
+    }
+    if (c.ats === 'hotjob') {
+      const h = require('./hotjob');
+      const r = await h.scrapeHotjob({ suiteId: c.suiteId, section: c.section || 'campus', keyword: '', maxJobs: 1, base: c.base, fallbackName: c.name });
       return (r && r.jobs && r.jobs.length > 0);
     }
   } catch (e) {

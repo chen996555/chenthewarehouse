@@ -66,15 +66,27 @@
     .wb-tt { font-size: 13px; font-weight: 600; color: #1F2329; line-height: 1.4; }
     .wb-c { font-size: 11px; color: #646A73; margin-top: 3px; }
     .wb-reason { font-size: 11px; color: #646A73; margin-top: 4px; line-height: 1.5; }
+    .wb-flags { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px; }
+    .flag-tag { font-size: 10px; color: #dc2626; background: #fef2f2; border: 1px solid #fecaca; border-radius: 4px; padding: 1px 6px; }
     .wb-points { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
     .pt { font-size: 10px; padding: 2px 6px; border-radius: 4px; }
     .pt.ok { background: #f0fdf4; color: #16a34a; }
     .pt.warn { background: #fef2f2; color: #dc2626; }
+    .match-dims { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .dim { display: flex; align-items: center; gap: 4px; }
+    .dim-label { font-size: 10px; color: #646A73; }
+    .dim-bar { width: 48px; height: 6px; border-radius: 3px; background: #eef1f5; overflow: hidden; }
+    .dim-fill { height: 100%; border-radius: 3px; }
+    .dim-fill.good { background: #16a34a; }
+    .dim-fill.bad { background: #f59e0b; }
     .wb-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
     .apply-btn { padding: 6px 14px; border: none; border-radius: 14px; font-size: 12px; font-weight: 600; cursor: pointer; background: #1456F0; color: #fff; }
     .apply-btn:hover { background: #133D9A; }
     .tailor-btn { padding: 6px 12px; border: 1px solid #1456F0; border-radius: 14px; font-size: 12px; font-weight: 600; cursor: pointer; background: #fff; color: #1456F0; }
     .tailor-btn:hover { background: #eef3ff; }
+    .add-board-btn { padding: 6px 12px; border: 1px solid #1456F0; border-radius: 14px; font-size: 12px; font-weight: 600; cursor: pointer; background: #fff; color: #1456F0; }
+    .add-board-btn:hover { background: #eef3ff; }
+    .add-board-btn:disabled { opacity: .6; cursor: not-allowed; }
     .apply-btn.done { background: #16a34a; }
     .apply-btn:disabled { opacity: .6; cursor: not-allowed; }
     .wb-link { font-size: 11px; color: #646A73; text-decoration: none; }
@@ -93,13 +105,40 @@
     .export-btn { width: 100%; padding: 9px; border: none; border-radius: 12px; background: #16a34a; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 10px; display: flex; align-items: center; justify-content: center; gap: 6px; }
     .search-input { width: 100%; padding: 9px 12px; border: 1px solid #e5e6e8; border-radius: 10px; font-size: 13px; margin-bottom: 8px; box-sizing: border-box; background: rgba(255,255,255,.85); color: #1F2329; }
     .search-input:focus { outline: none; border-color: #1456F0; }
+    .field-label { display: block; font-size: 12px; font-weight: 600; color: #1F2329; margin: 10px 2px 4px; }
+    .filter-bar { display: flex; gap: 8px; margin: 4px 0 12px; align-items: center; flex-wrap: wrap; }
+    .filter-bar svg { width: 16px; height: 16px; stroke: #8F959E; flex: none; }
+    .filter-select { flex: 1; min-width: 100px; padding: 8px 10px; border: 1px solid #e5e6e8; border-radius: 10px; font-size: 13px; background: rgba(255,255,255,.85); color: #1F2329; box-sizing: border-box; }
+    .filter-select:focus { outline: none; border-color: #1456F0; }
+    .mini-btn { padding: 8px 12px; border: none; border-radius: 10px; background: rgba(20,86,240,.1); color: #1456F0; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .mini-btn:hover { background: rgba(20,86,240,.18); }
     .toast { position: fixed; bottom: 72px; left: 50%; transform: translateX(-50%); background: #1F2329; color: #fff; padding: 10px 16px; border-radius: 20px; font-size: 13px; z-index: 9999; box-shadow: 0 4px 16px rgba(0,0,0,.25); display: none; max-width: 86%; text-align: center; animation: toast-in .2s ease; }
     .toast.success { background: #16a34a; }
     .toast.error { background: #ef4444; }
     @keyframes toast-in { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
     .export-btn:hover { background: #15803d; }
+    .export-link { margin-left: auto; font-size: 11px; font-weight: 600; color: #1456F0; cursor: pointer; text-decoration: none; flex: none; }
+    .export-link:hover { text-decoration: underline; }
     .empty { font-size: 13px; color: #8F959E; text-align: center; padding: 24px 12px; }
     .section-title { font-size: 13px; font-weight: 700; color: #1F2329; margin: 4px 2px 10px; display: flex; align-items: center; gap: 6px; }
+    .expand-btn { margin-left: auto; width: 26px; height: 26px; border: 1px solid #e5e6e8; border-radius: 8px; background: rgba(255,255,255,.7); color: #646A73; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex: none; }
+    .expand-btn:hover { background: #eef3ff; border-color: #1456F0; color: #1456F0; }
+    .sec-tag { font-size: 10px; border: 1px solid; border-radius: 4px; padding: 0 4px; margin-left: 4px; line-height: 1.4; }
+    .dismiss-btn { font-size: 11px; color: #8F959E; border: 1px solid #e5e6e8; border-radius: 6px; padding: 2px 8px; cursor: pointer; background: transparent; }
+    .dismiss-btn:hover { color: #ef4444; border-color: #ef4444; }
+    .dismiss-reasons { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+    .reason-btn { font-size: 11px; color: #646A73; border: 1px solid #e5e6e8; border-radius: 6px; padding: 3px 8px; cursor: pointer; background: rgba(255,255,255,.7); }
+    .reason-btn:hover { border-color: #ef4444; color: #ef4444; }
+    .reason-cancel { color: #8F959E; }
+    /* 窄屏（Side Panel 可拉窄）自适应：收 padding、降字号，避免内容被挤爆 */
+    @media (max-width: 340px) {
+      .view { padding: 8px; }
+      .glass-card { padding: 10px; }
+      .wb-card { padding: 10px; }
+      .wb-tt { font-size: 12px; }
+      .wb-reason { font-size: 10px; }
+      .dim-bar { width: 36px; }
+    }
   </style>
 </head>
 <body>
@@ -107,6 +146,7 @@
     <div class="head">
       <div class="avatar"><img id="avatar-img" src="avatar.svg" alt="" /></div>
       <div class="sub" id="sub">已就绪</div>
+      <button class="expand-btn" id="act-expand" title="在新窗口打开（更大界面）">⤢</button>
     </div>
     <div class="view" id="view"></div>
     <div class="progress" id="progress"></div>

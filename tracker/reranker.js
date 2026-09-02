@@ -26,17 +26,21 @@ function loadConfig() {
 }
 
 // 简历画像 + 岗位 → 重排查询文本（简历侧固定前缀）
+// 方向优先级：search_portrait.directions（画像生成，聚焦核心方向）> keywords > target_roles（简历解析，可能含泛化词如「产品经理」「数据分析」）
 function buildQuery(profile) {
   const bg = profile.background || {};
   const js = profile.job_search || {};
   const portrait = js.search_portrait;
-  const roles = (portrait && Array.isArray(portrait.keywords) && portrait.keywords.join(' ')) || (js.target_roles || []).join(' ');
+  const directions = (portrait && Array.isArray(portrait.directions)) ? portrait.directions.join(' ') : '';
+  const kws = (portrait && Array.isArray(portrait.keywords)) ? portrait.keywords.join(' ') : '';
+  const coreRoles = (Array.isArray(js.target_roles) ? js.target_roles : []).join(' ');
+  const roles = directions || kws || coreRoles;
   return [bg.experience_summary || '', roles].filter(Boolean).join(' ').slice(0, 1500);
 }
 
-// 岗位 → 文档文本
+// 岗位 → 文档文本（JD 加长到 1000：语义重排需覆盖职责/技能，截 400 会漏后半段信息）
 function buildDoc(job) {
-  return [job.title || '', job.jd || ''].join(' ').replace(/\s+/g, ' ').slice(0, 400);
+  return [job.title || '', job.jd || ''].join(' ').replace(/\s+/g, ' ').slice(0, 1000);
 }
 
 // ---- 档位 1：云端 API（硅基流动） --------------------------------------------

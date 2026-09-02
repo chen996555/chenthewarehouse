@@ -32,6 +32,7 @@ const companies = require('./companies');
 const scan = require('./scan');
 const resumeParse = require('./resume_parse');
 const portrait = require('./portrait');
+const encrypt = require('./encrypt');
 
 const PORT = process.env.PORT || 8630;
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -117,11 +118,12 @@ const scanTasks = new Map();
 async function handleApi(req, res, pathname, searchParams = new URLSearchParams()) {
   const db = dbApi.getDb();
   const _start = Date.now();
+  let _currentUser = null; // 鉴权结果，catch/finally 的审计日志也要用，必须在 try 块外声明
   try {
-    // 鉴权：从 Authorization: Bearer <token> 解析用户
     const authUser = () => {
       const token = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
-      return token ? dbApi.getUserByToken(db, token) : null;
+      _currentUser = token ? dbApi.getUserByToken(db, token) : null;
+      return _currentUser;
     };
 
     // POST /api/register —— 注册（需邀请码）
@@ -130,6 +132,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       const body = await readBody(req);
       if (String(body.inviteCode || '') !== INVITE_CODE) return send(res, 403, { error: '邀请码错误' });
       const user = dbApi.createUser(db, { username: body.username, password: body.password });
+      require('./logger').audit('注册', { userId: user.id, username: user.username });
       return send(res, 201, user);
     }
 
@@ -138,6 +141,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       if (!checkRateLimit('login:' + clientIp(req), 10, 60000)) return send(res, 429, { error: '请求过于频繁，请稍后再试' });
       const body = await readBody(req);
       const user = dbApi.loginUser(db, { username: body.username, password: body.password });
+      require('./logger').audit('登录', { userId: user.id, username: user.username });
       return send(res, 200, user);
     }
 
@@ -165,14 +169,20 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       try {
         const text = await resumeParse.extractText(tmpFile);
         const parsed = await resumeParse.llmParseProfile(text);
-        const profile = { meta: { owner: (parsed.identity && parsed.identity.legal_name) || '', updated: new Date().toISOString().slice(0, 10) }, ...parsed };
+        const profile = { meta: { owner: (parsed.identity && parsed.identity.legal_name) || '', updated: new Date().toISOString().slice(0, 10), profile_version: resumeParse.PROFILE_VERSION }, ...parsed };
+        // 一条龙：上传简历即生成搜索画像（search_portrait），存进 profile，点推荐时直接用
+        try {
+          const searchPortrait = await portrait.generateFromProfile(profile);
+          profile.job_search = profile.job_search || {};
+          profile.job_search.search_portrait = searchPortrait;
+        } catch (e) { console.error('[画像生成] 上传时生成 search_portrait 失败（推荐时兜底重生成）：', e.message.slice(0, 150)); }
         const user = authUser();
         if (user) dbApi.updateUserProfile(db, user.id, profile);
         // 保存原始简历文件（供「上传简历到官网」四两拨千斤），按用户隔离
         const uid = user ? user.id : 'anonymous';
         const resumeDir = path.join(__dirname, 'data', 'resume-files');
         fs.mkdirSync(resumeDir, { recursive: true });
-        fs.copyFileSync(tmpFile, path.join(resumeDir, `${uid}${ext}`));
+        fs.writeFileSync(path.join(resumeDir, `${uid}${ext}`), encrypt.encrypt(fs.readFileSync(tmpFile)));
         return send(res, 200, { profile, textLength: text.length, resumeFileName: `${uid}${ext}` });
       } finally {
         try { fs.unlinkSync(tmpFile); } catch {}
@@ -192,7 +202,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       if (!file) return send(res, 404, { error: '没有保存的简历文件，请先上传简历' });
       const ext = path.extname(file).toLowerCase();
       const mimeType = { '.pdf': 'application/pdf', '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.txt': 'text/plain' }[ext] || 'application/octet-stream';
-      return send(res, 200, { fileName: file, fileData: fs.readFileSync(path.join(resumeDir, file)).toString('base64'), mimeType });
+      return send(res, 200, { fileName: file, fileData: encrypt.decrypt(fs.readFileSync(path.join(resumeDir, file))).toString('base64'), mimeType });
     }
 
     // POST /api/resume/tailor —— 简历针对性优化（JD ↔ 简历匹配 + 定制建议）
@@ -215,6 +225,31 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       return send(res, 200, { username: user.username });
     }
 
+    // GET /api/account/export —— 导出我的全部数据（画像 + 投递记录，数据可携带权）
+    if (req.method === 'GET' && pathname === '/api/account/export') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      const data = dbApi.getUserData(db, user.id);
+      require('./logger').audit('导出数据', { userId: user.id });
+      return send(res, 200, data);
+    }
+
+    // DELETE /api/account —— 删除账号 + 关联数据（被遗忘权，不可恢复）
+    if (req.method === 'DELETE' && pathname === '/api/account') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      const data = dbApi.getUserData(db, user.id);
+      const ok = dbApi.deleteUser(db, user.id);
+      // 顺带删除该用户的简历文件（如有）
+      try {
+        const resumeDir = path.join(__dirname, 'data', 'resume-files');
+        const files = fs.readdirSync(resumeDir).filter((f) => f.startsWith(String(user.id) + '.'));
+        for (const f of files) fs.unlinkSync(path.join(resumeDir, f));
+      } catch {}
+      require('./logger').audit('删除账号', { userId: user.id, username: data ? data.username : '', deletedApplications: data ? data.applications.length : 0 });
+      return send(res, 200, { ok, deletedApplications: data ? data.applications.length : 0 });
+    }
+
     // POST /api/recommend —— 画像 → 扫描+打分 → 推荐清单（异步任务，轮询 /api/scan/status）
     if (req.method === 'POST' && pathname === '/api/recommend') {
       if (!checkRateLimit('recommend:' + clientIp(req), 5, 60000)) return send(res, 429, { error: '推荐请求过于频繁，请稍后再试' });
@@ -223,19 +258,52 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       const savedProfile = user ? dbApi.getUserProfile(db, user.id) : null;
       const profile = (savedProfile && savedProfile.identity) ? savedProfile : body.profile;
       if (!profile || !profile.identity) return send(res, 400, { error: '缺少 profile（画像）' });
-      // 单用户 MVP：画像写回 data/profile.json，再跑 portrait + scan
-      fs.writeFileSync(path.join(__dirname, 'data', 'profile.json'), JSON.stringify(profile, null, 2), 'utf8');
       const jobId = String(Date.now()).slice(-8) + Math.floor(Math.random() * 1000);
+      require('./logger').audit('发起推荐', { userId: user ? user.id : '', section: body.section || 'campus', mode: body.mode || 'precise', jobId });
       scanTasks.set(jobId, { status: 'running', progress: '生成搜索画像…', live: [] });
       (async () => {
         try {
-          await portrait.generate();
+          // profile 版本检查：llmParseProfile 逻辑改过（加 projects 字段、三级区分）→ 旧 profile 从简历文件自动重新解析，无需重新上传
+          let currentProfile = profile;
+          if (user && (!currentProfile.meta || currentProfile.meta.profile_version !== resumeParse.PROFILE_VERSION)) {
+            try {
+              const resumeDir = path.join(__dirname, 'data', 'resume-files');
+              const files = fs.readdirSync(resumeDir).filter((f) => f.startsWith(String(user.id) + '.'));
+              if (files.length) {
+                const ext = path.extname(files[0]).toLowerCase();
+                const plain = encrypt.decrypt(fs.readFileSync(path.join(resumeDir, files[0])));
+                const tmpFile = path.join(__dirname, 'data', `reparse-${Date.now()}${ext}`);
+                fs.writeFileSync(tmpFile, plain);
+                const text = await resumeParse.extractText(tmpFile);
+                const parsed = await resumeParse.llmParseProfile(text);
+                currentProfile = { meta: { owner: (parsed.identity && parsed.identity.legal_name) || '', updated: new Date().toISOString().slice(0, 10), profile_version: resumeParse.PROFILE_VERSION }, ...parsed };
+                try { fs.unlinkSync(tmpFile); } catch {}
+                scanTasks.set(jobId, { status: 'running', progress: '画像逻辑已升级，自动重新解析简历…', live: [] });
+              }
+            } catch (e) { console.error('[画像] profile 版本升级重新解析失败：', e.message.slice(0, 150)); }
+          }
+          // 多用户隔离：优先用 profile 里已生成的 search_portrait（上传简历时一条龙生成）；
+          // 画像版本号不匹配（改过生成逻辑）→ 自动失效重新生成，无需重新上传简历
+          const existingSp = currentProfile.job_search && currentProfile.job_search.search_portrait;
+          const spFresh = existingSp && Array.isArray(existingSp.keywords) && existingSp.keywords.length
+            && existingSp.version === portrait.SEARCH_PORTRAIT_VERSION;
+          const searchPortrait = spFresh ? existingSp : await portrait.generateFromProfile(currentProfile);
+          // 重新生成时，把新画像存回 profile（下次推荐直接复用，不用再生成）
+          if ((!spFresh || currentProfile !== profile) && user) {
+            try {
+              currentProfile.job_search = currentProfile.job_search || {};
+              currentProfile.job_search.search_portrait = searchPortrait;
+              dbApi.updateUserProfile(db, user.id, currentProfile);
+            } catch {}
+          }
           scanTasks.set(jobId, { status: 'running', progress: '扫描岗位并打分…', live: [] });
           const result = await scan.scanAll({
             section: body.section || 'campus',
-            importToBoard: body.importToBoard !== false,
+            importToBoard: false, // 推荐不再自动导入待投：由用户在推荐卡片上手动「加入待投」
             userId: user ? String(user.id) : '',
             mode: body.mode || 'precise', // broad 海投 / precise 精投
+            profile: currentProfile,
+            searchPortrait,
             onProgress: (msg) => {
               const t = scanTasks.get(jobId) || { live: [] };
               scanTasks.set(jobId, { status: 'running', progress: msg, live: t.live || [] });
@@ -254,6 +322,92 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       return send(res, 202, { jobId });
     }
 
+    // POST /api/email/sync —— 邮箱同步：IMAP 拉取 + 分类 + 匹配投递记录（人工确认后才更新状态）
+    if (req.method === 'POST' && pathname === '/api/email/sync') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      const body = await readBody(req);
+      const { email, authCode, imapHost, imapPort } = body || {};
+      try {
+        const emailMod = require('./email');
+        // 每次拉最近 30 天全量（不增量）：邮件数量不多（预过滤后几十封），全量最简单可靠，
+        // 避免增量游标导致「历史邮件变少」的体验问题（曾踩坑：增量游标 + 前端覆盖 → 9封变2封）
+        const results = await emailMod.syncEmails({ email, authCode, imapHost, imapPort });
+        // 匹配投递记录：公司级 blocking → 岗位级打分 → 三档置信度（resolveMatch）
+        const apps = dbApi.listApplications(db, user.id);
+        const matched = await Promise.all(results.map(async (r) => {
+          const m = await emailMod.resolveMatch(r, apps);
+          return {
+            subject: r.subject, from: r.from, status: r.status, company: r.company,
+            title: r.title, interviewTime: r.interviewTime, matchedBy: r.matchedBy,
+            confidence: m.confidence,
+            matchedApp: m.matchedApp ? { id: m.matchedApp.id, company: m.matchedApp.company, title: m.matchedApp.title, status: m.matchedApp.status } : null,
+            candidates: m.candidates.map((c) => ({ id: c.id, company: c.company, title: c.title, status: c.status })),
+          };
+        }));
+        return send(res, 200, { count: results.length, results: matched });
+      } catch (e) {
+        // imapflow 错误带 responseStatus/responseText/executedCommand，带上便于定位是哪个 IMAP 命令失败
+        const detail = [e.responseStatus, e.responseText, e.executedCommand].filter(Boolean).join(' | ');
+        require('./logger').error('邮箱同步失败', { userId: user.id, email, msg: e.message, detail: detail || '' });
+        return send(res, 500, { error: '邮箱同步失败：' + e.message + (detail ? '（' + String(detail).slice(0, 300) + '）' : '') });
+      }
+    }
+
+    // POST /api/email/apply —— 应用邮件识别结果（更新投递状态，人工确认后调用）
+    if (req.method === 'POST' && pathname === '/api/email/apply') {
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
+      const body = await readBody(req);
+      const { appId, status } = body || {};
+      const STATUS_MAP = { interview: 'interview', offer: 'offer', rejected: 'rejected', assessment: 'replied' };
+      const newStatus = STATUS_MAP[status];
+      if (!appId || !newStatus) return send(res, 400, { error: '参数错误' });
+      const updated = dbApi.updateApplication(db, String(appId), { status: newStatus }, user.id);
+      if (!updated) return send(res, 404, { error: '投递记录不存在' });
+      return send(res, 200, { ok: true, status: newStatus });
+    }
+
+    // POST /api/autofill/map-fields —— LLM 语义字段映射（只收字段描述符，不收简历值，隐私设计）
+    if (req.method === 'POST' && pathname === '/api/autofill/map-fields') {
+      const body = await readBody(req);
+      const { signals, keys } = body || {};
+      if (!Array.isArray(signals) || !signals.length || !Array.isArray(keys)) return send(res, 400, { error: '参数错误' });
+      try {
+        const fs = require('node:fs');
+        const path = require('node:path');
+        let cfg = {};
+        try { cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'scorer-config.json'), 'utf8')); } catch {}
+        const apiKey = String(cfg.apiKey || process.env.DEEPSEEK_API_KEY || '');
+        const baseUrl = String(cfg.baseUrl || process.env.SCORER_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, '');
+        const model = String(cfg.judgeModel || process.env.SCORER_JUDGE_MODEL || 'deepseek-chat');
+        if (!apiKey) return send(res, 500, { error: '未配置 LLM' });
+        const prompt = `你是表单字段语义匹配助手。把每个表单字段映射到候选人档案的一个字段。
+
+档案字段 keys：${JSON.stringify(keys)}
+表单字段（index + 描述符，只含标签/占位符，不含简历值）：${JSON.stringify(signals.map((s) => ({ index: s.index, signal: s.signal, tag: s.tag })))}
+
+输出严格 JSON：{"mapping": [{"index": 0, "key": "name"}]}
+规则：只映射能确定对应的字段（如「中文姓名」→name、「联系方式」→phone、「最高学历」→degree）；无法确定的不放进 mapping。只返回 JSON，不要其他文字。`;
+        const lr = await fetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], temperature: 0.1, max_tokens: 500 }),
+        });
+        const j = await lr.json();
+        const content = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+        const start = content.indexOf('{');
+        const end = content.lastIndexOf('}') + 1;
+        let mapping = [];
+        if (start >= 0 && end > start) {
+          try { mapping = (JSON.parse(content.slice(start, end)).mapping || []).filter((m) => keys.includes(m.key)); } catch {}
+        }
+        return send(res, 200, { mapping });
+      } catch (e) {
+        return send(res, 500, { error: '字段映射失败：' + e.message });
+      }
+    }
+
     // GET /api/meta —— 状态机与渠道定义
     if (req.method === 'GET' && pathname === '/api/meta') {
       return send(res, 200, {
@@ -261,6 +415,23 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
         statusOrder: dbApi.STATUS_ORDER,
         transitions: dbApi.TRANSITIONS,
         channels: dbApi.CHANNELS,
+      });
+    }
+
+    // GET /healthz —— 健康检查 + 基础监控指标（探活/监控用，无需鉴权）
+    if (req.method === 'GET' && pathname === '/healthz') {
+      const mem = process.memoryUsage();
+      let dbStatus = 'ok';
+      try { dbApi.getDb().prepare('SELECT 1').get(); } catch { dbStatus = 'error'; }
+      return send(res, 200, {
+        status: dbStatus === 'ok' ? 'ok' : 'degraded',
+        uptime: Math.round(process.uptime()),
+        memory: { rssMB: Math.round(mem.rss / 1024 / 1024), heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024) },
+        db: dbStatus,
+        activeScanTasks: scanTasks.size,
+        activeScoreTasks: scoreTasks.size,
+        version: '0.2.0',
+        time: new Date().toISOString(),
       });
     }
 
@@ -288,7 +459,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       const user = authUser();
       if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
-      const result = dbApi.importApplication(db, search.jobToApplication(body));
+      const result = dbApi.importApplication(db, { ...search.jobToApplication(body), user_id: String(user.id) });
       return send(res, result.created ? 201 : 200, result);
     }
 
@@ -307,7 +478,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
       if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
       const input = zhiye.zhiyeToApplication(body.job, { company: body.company, url: body.url });
-      const result = dbApi.importApplication(db, input);
+      const result = dbApi.importApplication(db, { ...input, user_id: String(user.id) });
       return send(res, result.created ? 201 : 200, result);
     }
 
@@ -494,7 +665,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
                                   : body.adapter === 'ne'
                                     ? ne.neToApplication(body.job, { company: body.company, url: body.url })
                                     : zhiye.zhiyeToApplication(body.job, { company: body.company, url: body.url });
-      const result = dbApi.importApplication(db, input);
+      const result = dbApi.importApplication(db, { ...input, user_id: String(user.id) });
       return send(res, result.created ? 201 : 200, result);
     }
 
@@ -509,7 +680,7 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
     if (req.method === 'GET' && pathname === '/api/activity') {
       const user = authUser();
       if (!user) return send(res, 401, { error: '未登录' });
-      return send(res, 200, dbApi.getActivity(db));
+      return send(res, 200, dbApi.getActivity(db, user.id));
     }
 
     // GET /api/applications —— 列表（附投递限制预警）
@@ -528,49 +699,61 @@ async function handleApi(req, res, pathname, searchParams = new URLSearchParams(
     if (req.method === 'POST' && pathname === '/api/applications/mark-applied') {
       const body = await readBody(req);
       const user = authUser();
-      const app = dbApi.findByJobId(db, body.job_id, body.company, user ? user.id : '');
+      if (!user) return send(res, 401, { error: '未登录' });
+      const app = dbApi.findByJobId(db, body.job_id, body.company, user.id);
       if (!app) return send(res, 404, { error: '岗位不在待投看板中（可能未导入或已投）' });
-      return send(res, 200, dbApi.updateApplication(db, app.id, { status: 'applied' }));
+      const updated = dbApi.updateApplication(db, app.id, { status: 'applied' }, user.id);
+      require('./logger').audit('标记已投递', { userId: user.id, appId: app.id, company: app.company || '', title: app.title || '' });
+      return send(res, 200, updated);
     }
 
-    // POST /api/applications —— 新建
+    // POST /api/applications —— 加入待投（幂等：company+job_id 去重，重复加入不产生重复记录）
     if (req.method === 'POST' && pathname === '/api/applications') {
       const user = authUser();
       if (!user) return send(res, 401, { error: '未登录' });
       const body = await readBody(req);
-      return send(res, 201, dbApi.createApplication(db, { ...body, user_id: user.id }));
+      // 关键：user_id 必须转成字符串。sanitizeApplication 的 str() 只接受字符串，
+      // 传数字会被转成空字符串 ""，导致记录「不属于任何用户」在投递看板查不到。
+      const result = dbApi.importApplication(db, { ...body, user_id: String(user.id) });
+      return send(res, result.created ? 201 : 200, result);
     }
 
-    // /api/applications/:id —— 查 / 改 / 删
+    // /api/applications/:id —— 查 / 改 / 删（需登录，且只能操作自己的记录）
     const match = pathname.match(/^\/api\/applications\/([^/]+)(?:\/history)?$/);
     if (match) {
       const id = decodeURIComponent(match[1]);
       const isHistory = pathname.endsWith('/history');
+      const user = authUser();
+      if (!user) return send(res, 401, { error: '未登录' });
 
       if (isHistory && req.method === 'GET') {
-        return send(res, 200, dbApi.getHistory(db, id));
+        return send(res, 200, dbApi.getHistory(db, id, user.id));
       }
       if (!isHistory && req.method === 'GET') {
-        const app = dbApi.getApplication(db, id);
+        const app = dbApi.getApplication(db, id, user.id);
         return app ? send(res, 200, app) : send(res, 404, { error: '记录不存在' });
       }
       if (!isHistory && req.method === 'PATCH') {
         const body = await readBody(req);
-        const updated = dbApi.updateApplication(db, id, body);
+        const before = dbApi.getApplication(db, id, user.id);
+        const updated = dbApi.updateApplication(db, id, body, user.id);
+        if (updated) require('./logger').audit('修改投递记录', { userId: user.id, appId: id, company: updated.company || '', status: `${before ? before.status : '?'}→${updated.status}` });
         return updated ? send(res, 200, updated) : send(res, 404, { error: '记录不存在' });
       }
       if (!isHistory && req.method === 'DELETE') {
-        const ok = dbApi.deleteApplication(db, id);
+        const target = dbApi.getApplication(db, id, user.id);
+        const ok = dbApi.deleteApplication(db, id, user.id);
+        if (ok) require('./logger').audit('删除投递记录', { userId: user.id, appId: id, company: target ? target.company : '', title: target ? target.title : '' });
         return ok ? send(res, 204, '') : send(res, 404, { error: '记录不存在' });
       }
     }
 
     send(res, 404, { error: '接口不存在' });
   } catch (e) {
-    require('./logger').error('API 错误', { method: req.method, path: pathname, error: e.message });
+    require('./logger').error('API 错误', { method: req.method, path: pathname, userId: _currentUser ? _currentUser.id : '', error: e.message });
     send(res, 400, { error: e.message });
   } finally {
-    require('./logger').info('API 请求', { method: req.method, path: pathname, ms: Date.now() - _start });
+    require('./logger').info('API 请求', { method: req.method, path: pathname, userId: _currentUser ? _currentUser.id : '', ms: Date.now() - _start });
     db.close();
   }
 }
@@ -589,7 +772,7 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
   const url = new URL(req.url, 'http://localhost');
-  if (url.pathname.startsWith('/api/')) {
+  if (url.pathname.startsWith('/api/') || url.pathname === '/healthz') {
     handleApi(req, res, url.pathname, url.searchParams).catch((e) => send(res, 500, { error: e.message }));
   } else {
     serveStatic(res, url.pathname);

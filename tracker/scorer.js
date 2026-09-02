@@ -32,6 +32,8 @@ const detail = require('./detail');
 // ---- 打分缓存（确定性层：同一岗位不重复打分） ----------------------------------
 
 const CACHE_PATH = path.join(__dirname, 'data', 'score-cache.json');
+// 缓存版本号：改判定逻辑（prompt/字段）时 +1，旧判定缓存自动失效
+const CACHE_VERSION = 'v4'; // v4：判定 direction 严格化 + 目标方向改用 directions，旧判定缓存（direction=2）失效
 let cacheStore = null;
 
 function loadCache() {
@@ -50,7 +52,28 @@ function saveCache() {
 }
 
 function cacheKey(job, profileKey = '') {
-  const raw = `${profileKey}|${job.company || ''}|${job.title || ''}`;
+  const raw = `${CACHE_VERSION}|${profileKey}|${job.company || ''}|${job.title || ''}`;
+  return crypto.createHash('md5').update(raw).digest('hex').slice(0, 16);
+}
+
+// ---- JD 结构化抽取缓存（跨用户复用：JD 抽取不依赖画像，key 不含 profileKey）----
+const JD_CACHE_PATH = path.join(__dirname, 'data', 'jd-cache.json');
+let jdCacheStore = null;
+
+function loadJdCache() {
+  if (jdCacheStore) return jdCacheStore;
+  try { jdCacheStore = JSON.parse(fs.readFileSync(JD_CACHE_PATH, 'utf8')); } catch { jdCacheStore = {}; }
+  return jdCacheStore;
+}
+
+function saveJdCache() {
+  if (!jdCacheStore) return;
+  try { fs.writeFileSync(JD_CACHE_PATH, JSON.stringify(jdCacheStore), 'utf8'); } catch {}
+}
+
+// JD 抽取缓存 key：company + title（不含画像，跨用户复用）
+function jdCacheKey(job) {
+  const raw = `${CACHE_VERSION}|${job.company || ''}|${job.title || ''}`;
   return crypto.createHash('md5').update(raw).digest('hex').slice(0, 16);
 }
 
@@ -129,7 +152,8 @@ function hardFilter(job, profile) {
   ];
 
   // 社招岗位（应届生默认排除：社招通常要求 1 年以上全职经验）
-  if (jobCategory(job) === 'social') {
+  // section 是可靠的社招标记（适配器 mapJob 计算）；jobCategory 只看 type 字段，会漏判（type="全职"但 section="social"）
+  if (job.section === 'social' || jobCategory(job) === 'social') {
     checks.push({ keep: false, reason: '社招岗位（应届生按默认排除，可用 typeFilter 覆盖）' });
   }
 
@@ -212,6 +236,12 @@ function parseJsonLoose(text) {
 
 function buildProfileSystem(profile) {
   const bg = profile.background;
+  const js = profile.job_search || {};
+  const portrait = js.search_portrait;
+  // 目标方向优先用 search_portrait.directions（聚焦核心方向），fallback target_roles（简历解析可能含泛化词「产品经理」「数据分析」）
+  const directions = (portrait && Array.isArray(portrait.directions)) ? portrait.directions.join('、') : '';
+  const targetRoles = (js.target_roles || []).join('、');
+  const goal = directions || targetRoles;
   return `你是严谨的校招匹配评估员。只依据候选人简历与岗位 JD 中明确的事实评估，不编造、不脑补。
 
 ## 候选人（2027 届应届，硕士）
@@ -219,63 +249,138 @@ function buildProfileSystem(profile) {
 - 证书：${(bg.certificates || []).join('、')}
 - 技能：${(bg.skills || []).join('、')}
 - 经历摘要：${bg.experience_summary}
-- 目标方向：${profile.job_search.target_roles.join('、')}
-- 期望城市：${profile.job_search.cities.join('/')}`;
+- 目标方向：${goal}
+- 期望城市：${js.cities.join('/')}`;
 }
 
 // 岗位列表 → user 消息（判定版：抽取硬要求 + 4 项低分辨率判定）
-function buildJudgeUser(jobs) {
+// ---- 阶段 4a：JD 结构化抽取（全量 JD，不截断，跨用户缓存复用）----
+
+function buildExtractUser(jobs) {
   const jobLines = jobs.map((j, i) => {
-    const jd = String(j.jd || '').replace(/\s+/g, ' ').slice(0, 400);
-    const meta = [
-      j.location ? `地点:${j.location}` : '',
-      j.type ? `类型:${j.type}` : '',
-      j.program ? `项目:${j.program}` : '',
-      j.degree ? `学历要求:${j.degree}` : '',
-      j.date ? `发布:${j.date}` : '',
-    ].filter(Boolean).join('；');
-    return `【岗位${i}】id:${j.id} | ${j.company}｜${j.title}｜${meta}｜JD:${jd || '(无JD)'}`;
+    const jd = String(j.jd || '').replace(/\s+/g, ' '); // 全量，不截断（硬门槛可能在 JD 末尾，截断会漏判）
+    return `【岗位${i}】id:${j.id} | ${j.company}｜${j.title}｜JD:${jd || '(无JD)'}`;
   }).join('\n\n');
 
   return `## 岗位列表（共 ${jobs.length} 个）
 ${jobLines}
 
-## 对每个岗位打 4 个整数分（每项 0-2，据标题/JD 与候选人画像比对）：
-- duty_match 职责相关度：0 无关 / 1 部分相关 / 2 高度相关
-- transferable 成果可迁移：0 不能 / 1 部分 / 2 充分
-- skill_gap 硬技能缺口：0 无缺口 / 1 有缺口 / 2 严重缺口（越大越不匹配）
-- direction 方向命中：0 否 / 1 相邻 / 2 是
+## 对每个岗位从 JD 抽取结构化信息：
+- hard_reqs 硬性要求数组（仅 JD 明确写出的必须满足项，宁缺毋滥）：
+  - field：degree(学历) / graduation(届次) / experience(工作经验) / cert(证书) / major(专业)
+  - value：原文要求（如「硕士」「2027届」「1年以上」「CET-6」）
+  - req：must（明确必须）或 preferred（优先，非硬性）
+- skills：核心技能关键词数组（工具/方法论/业务能力，如「Java」「数据分析」）
+- duty_summary：职责一句话摘要（30 字内，概括核心职责）
 
-## 并抽取每个岗位的「硬性要求」hard_reqs（仅 JD 明确写出的必须满足项，宁缺毋滥）：
-- field 取值：degree(学历) / graduation(届次) / experience(工作经验) / cert(证书) / major(专业)
-- value：原文要求（如「硕士」「2027届」「1年以上」「CET-6」）
-- req：must（明确必须）或 preferred（优先，非硬性）
-若 JD 未明确写出，则 hard_reqs 为空数组 []
-
-## 输出（严格 JSON，不要 Markdown 代码块，不要输出任何推理/解释文字）
-{"results":[{"idx":0,"hard_reqs":[{"field":"degree","value":"硕士","req":"must"}],"judge":{"duty_match":2,"transferable":1,"skill_gap":0,"direction":2}}]}
+## 输出（严格 JSON，不要 Markdown 代码块，不要解释）
+{"results":[{"idx":0,"hard_reqs":[{"field":"degree","value":"硕士","req":"must"}],"skills":["Java"],"duty_summary":"负责后端开发"}]}
 按 idx 升序输出，共 ${jobs.length} 条，不得遗漏、不得改变 idx。`;
 }
 
-// 判定调用（非推理模型）：返回 [{idx(全局), hard_reqs, judge}]
+// JD 抽取（跨用户缓存：key 不含画像，同一岗位只抽一次）
+async function extractJdJobs(jobs) {
+  const cache = loadJdCache();
+  const extractions = new Array(jobs.length).fill(null);
+  const uncached = []; // { job, gi }
+
+  for (let i = 0; i < jobs.length; i++) {
+    const key = jdCacheKey(jobs[i]);
+    const hit = cache[key];
+    if (hit && Array.isArray(hit.hard_reqs)) extractions[i] = hit;
+    else uncached.push({ job: jobs[i], gi: i });
+  }
+
+  if (uncached.length) {
+    const chunkSize = 8;
+    const chunks = [];
+    for (let i = 0; i < uncached.length; i += chunkSize) {
+      chunks.push({ offset: i, jobs: uncached.slice(i, i + chunkSize).map((e) => e.job) });
+    }
+    const extractChunk = async ({ jobs: chunk }) => {
+      const user = buildExtractUser(chunk);
+      const raw = await callLLM([{ role: 'user', content: user }], { model: LLM_CONFIG.judgeModel, temperature: 0.1 });
+      const parsed = parseJsonLoose(raw);
+      if (!parsed || !Array.isArray(parsed.results)) throw new Error(`JD 抽取格式无效：${raw.slice(0, 200)}`);
+      return parsed.results;
+    };
+    for (let i = 0; i < chunks.length; i += 6) {
+      const group = chunks.slice(i, i + 6);
+      await Promise.all(group.map(async (c) => {
+        try {
+          const results = await extractChunk(c);
+          results.forEach((r) => {
+            const idx = Number(r.idx); // 用 LLM 返回的 idx 字段（而非数组位置），防乱序错位
+            const e = uncached[c.offset + idx];
+            if (!e) return;
+            const key = jdCacheKey(e.job);
+            cache[key] = { hard_reqs: r.hard_reqs || [], skills: r.skills || [], duty_summary: r.duty_summary || '' };
+            extractions[e.gi] = cache[key];
+          });
+        } catch (e) {
+          console.error('[JD抽取] 单批失败：', e.message.slice(0, 120));
+        }
+      }));
+    }
+    saveJdCache();
+  }
+
+  return extractions; // [{ hard_reqs, skills, duty_summary } | null]
+}
+
+// ---- 阶段 4b：匹配判定（用抽取的结构化摘要，不读全文 JD）----
+
+function buildJudgeUser(jobs, extractions) {
+  const jobLines = jobs.map((j, i) => {
+    const ex = (extractions && extractions[i]) || {};
+    const hard = (ex.hard_reqs || []).map((r) => `${r.field}:${r.value}(${r.req})`).join('、') || '无';
+    const skills = (ex.skills || []).join('、') || '无';
+    const duty = ex.duty_summary || '';
+    const meta = [
+      j.location ? `地点:${j.location}` : '',
+      j.type ? `类型:${j.type}` : '',
+      j.degree ? `学历:${j.degree}` : '',
+    ].filter(Boolean).join('；');
+    return `【岗位${i}】id:${j.id} | ${j.company}｜${j.title}｜${meta}｜硬性要求:${hard}｜技能:${skills}｜职责:${duty}`;
+  }).join('\n\n');
+
+  return `## 岗位列表（共 ${jobs.length} 个，已抽取结构化信息）
+${jobLines}
+
+## 对每个岗位打 4 个整数分（每项 0-2，据抽取的结构化信息与候选人画像比对）：
+- duty_match 职责相关度：0 无关 / 1 部分相关 / 2 高度相关
+- transferable 成果可迁移：0 不能 / 1 部分 / 2 充分
+- skill_gap 硬技能缺口：0 无缺口 / 1 有缺口 / 2 严重缺口（越大越不匹配）
+- direction 方向命中：0 否 / 1 相邻 / 2 是（严格判断：只有岗位的「核心职能方向」与候选人画像的「核心目标方向」一致才给 2；泛化的能力重叠不算方向命中，给 0 或 1）
+
+## 输出（严格 JSON，不要 Markdown 代码块，不要解释）
+{"results":[{"idx":0,"judge":{"duty_match":2,"transferable":1,"skill_gap":0,"direction":2}}]}
+按 idx 升序输出，共 ${jobs.length} 条，不得遗漏、不得改变 idx。`;
+}
+
+// 判定调用（非推理模型）：先抽 JD（跨用户缓存复用），再判定。返回 [{idx(全局), hard_reqs, judge}]
 async function judgeJobs(jobs, profile, model = LLM_CONFIG.judgeModel) {
   const chunkSize = 8;    // 8 岗一批：既不截断，又不让非推理模型偷懒打 0 分
   const concurrency = 8;  // 并行批次（触发限流时降到 2）
 
+  // 阶段 4a：JD 抽取（全量 JD，跨用户缓存，硬门槛不漏判）
+  const extractions = await extractJdJobs(jobs);
+
   const chunks = [];
   for (let i = 0; i < jobs.length; i += chunkSize) {
-    chunks.push({ offset: i, jobs: jobs.slice(i, i + chunkSize) });
+    chunks.push({ offset: i, jobs: jobs.slice(i, i + chunkSize), ex: extractions.slice(i, i + chunkSize) });
   }
 
   const system = buildProfileSystem(profile);
-  const judgeChunk = async ({ offset, jobs: chunk }) => {
-    const user = buildJudgeUser(chunk);
+  const judgeChunk = async ({ offset, jobs: chunk, ex }) => {
+    const user = buildJudgeUser(chunk, ex);
     const raw = await callLLM([{ role: 'system', content: system }, { role: 'user', content: user }], { model });
     const parsed = parseJsonLoose(raw);
     if (!parsed || !Array.isArray(parsed.results)) {
       throw new Error(`判定返回格式无效（前 200 字）：${raw.slice(0, 200)}`);
     }
-    return parsed.results.map((r) => ({ ...r, idx: Number(r.idx) + offset }));
+    // hard_reqs 从 JD 抽取结果取（不依赖判定重新抽），judge 用判定结果
+    return parsed.results.map((r) => ({ ...r, hard_reqs: (ex[Number(r.idx)] || {}).hard_reqs || [], idx: Number(r.idx) + offset }));
   };
 
   const results = [];
@@ -295,6 +400,30 @@ async function judgeJobs(jobs, profile, model = LLM_CONFIG.judgeModel) {
 }
 
 // ---- 阶段四补：硬门槛代码复核 -------------------------------------------------
+
+// 毒点扫描：JD/标题里的「坑」关键词（外包/单休/996/派遣），反向下钻供报告标注 + 降档
+// 硬毒点（外包/派遣）降一档；软毒点（单休/倒班）只标注不降档，宁保守不误杀
+const RED_FLAGS = [
+  { word: '外包', label: '外包', hard: true },
+  { word: '劳务派遣', label: '劳务派遣', hard: true },
+  { word: '第三方', label: '第三方派遣', hard: true },
+  { word: '单休', label: '单休', hard: false },
+  { word: '996', label: '996', hard: false },
+  { word: '大小周', label: '大小周', hard: false },
+  { word: '倒班', label: '倒班', hard: false },
+  { word: '轮班', label: '轮班', hard: false },
+  { word: '驻场', label: '驻场', hard: false },
+  { word: '派驻', label: '派驻', hard: false },
+  { word: '长期出差', label: '长期出差', hard: false },
+];
+function scanRedFlags(jd, title) {
+  const text = `${title || ''} ${jd || ''}`;
+  const flags = [];
+  for (const f of RED_FLAGS) {
+    if (text.includes(f.word)) flags.push(f.label);
+  }
+  return flags;
+}
 
 // 用 LLM 抽取出的 hard_reqs 与 profile 精确比对，产出 gate 状态（pass/maybe/fail）
 // 只对高置信度字段（学历/工作经验/届次）做硬否决，其余一律降为「存疑」，宁保守不误杀。
@@ -428,7 +557,7 @@ function keywordPreRank(jobs, profile) {
     : (js.target_roles || []).join(' ')
         .split(/[（()、/，,\s]+/)
         .map((s) => s.trim())
-        .filter((s) => s.length >= 2 && /采购|供应链|招标|寻源|降本|供应商|履约|品类/.test(s));
+        .filter((s) => s.length >= 2); // 通用：所有方向词都保留，不硬编码任何行业（面向大众）
   const scored = jobs.map((job) => {
     const title = String(job.title || '');
     const jd = String(job.jd || '').slice(0, 2000);
@@ -476,7 +605,7 @@ function diversityPick(ranked, cap, maxPerCompany) {
 async function scoreJobs(jobs, opts = {}) {
   const progress = opts.onProgress || (() => {});
   const profile = opts.profile || loadProfile();
-  const companyLimit = Number(profile.job_search.company_limit || 3);
+  const companyLimit = Number(profile.job_search.company_limit || 6); // 每公司 A/B 档上限：3 太严（大公司岗位多），放宽到 6
   const rrCap = Number(opts.rrCap || 150); // 进 LLM 判定的岗位数上限（语义重排 top N）
   // 缓存命名空间：不同候选人的判定结果不可复用（打分依赖画像），用 owner 隔离
   const profileKey = String(profile.meta && profile.meta.owner || profile.identity && profile.identity.legal_name || 'default');
@@ -572,13 +701,21 @@ async function scoreJobs(jobs, opts = {}) {
     let item;
     if (r && r.judge) {
       const g = computeGate(r, jdMissing, profile);
-      const t = tierJob(g.status, r.judge);
+      let t = tierJob(g.status, r.judge);
+      const redFlags = scanRedFlags(job.jd, job.title);
+      // 硬毒点（外包/派遣）降一档：A→B→C，D 不降；软毒点只标注不降档
+      const hasHardFlag = redFlags.some((f) => (RED_FLAGS.find((x) => x.label === f) || {}).hard);
+      if (hasHardFlag && t.tier !== 'D') {
+        const order = ['A', 'B', 'C', 'D'];
+        t = { ...t, tier: order[Math.min(order.indexOf(t.tier) + 1, 3)] };
+      }
       item = {
         ...job,
         score: t.score,
         tier: t.tier,
         gate: g.status,
         gateReasons: g.reasons,
+        redFlags,
         judge: r.judge,
         verdict: makeVerdict(t.tier, g.status, g.reasons),
         suggestion: SUGGESTION[t.tier],
@@ -651,7 +788,28 @@ async function scoreJobs(jobs, opts = {}) {
     }
   }
 
-  // 阶段 7：重建分档 + 公司预算
+  // 阶段 6.5：反馈闭环校准（投递结果回校准打分，让打分随投递越用越准）
+  let feedbackAdj = { A: 0, B: 0, C: 0, D: 0 };
+  let dismissedCompanies = [];
+  try {
+    const feedback = require('./feedback');
+    feedbackAdj = feedback.computeTierAdjustment();
+    const dismiss = feedback.computeDismissSignals();
+    dismissedCompanies = dismiss.dismissedCompanies;
+    if (Object.values(feedbackAdj).some((v) => v !== 0)) progress(`反馈校准偏移：${JSON.stringify(feedbackAdj)}`);
+    if (dismissedCompanies.length) progress(`公司降权 ${dismissedCompanies.length} 家（用户不感兴趣）`);
+  } catch {}
+
+  // 阶段 7：重建分档 + 公司预算（应用反馈偏移 + 公司黑名单降权）
+  for (const item of rankedAll) {
+    const adj = feedbackAdj[item.tier] || 0;
+    if (adj) item.score = Math.max(0, Math.min(100, item.score + adj));
+    // 公司黑名单：用户「公司不感兴趣」→ 降分 + 掉出 A/B 档（明确负反馈，不该再推荐）
+    if (dismissedCompanies.includes(item.company)) {
+      item.score = Math.max(0, item.score - 15);
+      if (item.tier === 'A' || item.tier === 'B') item.tier = 'C';
+    }
+  }
   rankedAll.sort((a, b) => b.score - a.score);
   const tiers = { A: [], B: [], C: [], D: [] };
   for (const item of rankedAll) tiers[item.tier].push(item);

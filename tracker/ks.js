@@ -49,7 +49,7 @@ async function fetchKsPage({ pageNum, pageSize, keyword }) {
 function mapKsJob(item, dict) {
   const cities = Array.isArray(item.workLocationDicts) ? item.workLocationDicts.map((d) => d.name).filter(Boolean) : [];
   return {
-    id: String(item.code || item.id || ''),
+    id: String(item.id || item.code || ''),
     title: item.name || '',
     team: item.departmentName || '',
     location: cities.join('、'),
@@ -57,7 +57,7 @@ function mapKsJob(item, dict) {
     category: dict.category[item.positionCategoryCode] || '',
     program: '',
     date: String(item.releaseTime || '').slice(0, 10),
-    detailUrl: `${BASE}/#/campus/job-info/${item.code || item.id}`,
+    detailUrl: `${BASE}/#/campus/job-info/${item.id || item.code}`,
     jd: [item.description, item.positionDemand].filter(Boolean).join('\n'),
   };
 }

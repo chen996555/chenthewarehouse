@@ -147,5 +147,34 @@
     }
   }
 
-  window.JobStarAutofill = { scanAndFill, matchField, normalizeText, FIELD_RULES, isDateField, uploadResumeFile };
+  // ---- 收集「规则未匹配」的字段（供 LLM 语义映射兜底，只发描述符，不发简历值）----
+  function collectUnmatched() {
+    const els = [...document.querySelectorAll('input, select, textarea')].filter((el) => el.type !== 'file' && el.type !== 'hidden');
+    const unmatched = [];
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      const signal = signalOf(el).trim();
+      if (!signal) continue;
+      if (matchField(signal)) continue; // 规则已匹配，跳过
+      unmatched.push({ index: i, signal: signal.slice(0, 60), tag: el.tagName, type: el.type });
+    }
+    return unmatched;
+  }
+
+  // ---- 用 LLM 映射结果（index → key）写值：本地确定性写，AI 只给映射 ----
+  function applyMapping(profileValues, mapping) {
+    const els = [...document.querySelectorAll('input, select, textarea')].filter((el) => el.type !== 'file' && el.type !== 'hidden');
+    const written = [];
+    for (const m of mapping || []) {
+      const el = els[m.index];
+      if (!el) continue;
+      const val = profileValues[m.key];
+      if (val === undefined || val === '') continue;
+      if (el.tagName === 'SELECT') { if (setSelectValue(el, val)) written.push({ key: m.key, value: val, tag: 'SELECT' }); }
+      else { setNativeValue(el, val); written.push({ key: m.key, value: val, tag: el.tagName }); }
+    }
+    return written;
+  }
+
+  window.JobStarAutofill = { scanAndFill, matchField, normalizeText, FIELD_RULES, isDateField, uploadResumeFile, collectUnmatched, applyMapping, signalOf };
 })();

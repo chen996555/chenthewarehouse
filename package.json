@@ -19,6 +19,8 @@
   },
   "homepage": "https://github.com/chen996555/chenthewarehouse#readme",
   "dependencies": {
+    "imapflow": "^1.7.7",
+    "mailparser": "^3.9.20",
     "mammoth": "^1.12.2",
     "pdf-parse": "^2.4.5"
   }

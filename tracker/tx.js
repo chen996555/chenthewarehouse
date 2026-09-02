@@ -46,7 +46,7 @@ function mapTxJob(item) {
     category: '',
     program: item.projectName || '',
     date: '',
-    detailUrl: item.postId ? `${BASE}/post.html?postId=${item.postId}` : `${BASE}/post.html`,
+    detailUrl: item.position ? `${BASE}/post.html?query=p_${item.position}` : `${BASE}/post.html`,
     jd: '',
   };
 }

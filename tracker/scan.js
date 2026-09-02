@@ -46,10 +46,15 @@ const wecruit = require('./wecruit');
 const huawei = require('./huawei');
 const vivo = require('./vivo');
 const embedding = require('./embedding');
+const tupu360 = require('./tupu360');
+const workday = require('./workday');
+const iguopin = require('./iguopin');
 
 // 扫描结果缓存（公司+关键词 → 岗位列表）：第二次扫描命中缓存秒级复用，不重复抓取
 const JOBS_CACHE_PATH = path.join(__dirname, 'data', 'jobs-cache.json');
-const JOBS_CACHE_TTL = 2 * 60 * 60 * 1000; // 2 小时有效期（岗位数据短时间内不变）
+const JOBS_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 小时有效期（配合每天定时预抓，岗位数据一天刷新一次）
+// 缓存版本号：改岗位字段逻辑（section/location/清洗）时 +1，旧缓存自动失效，无需手动清
+const CACHE_VERSION = 'v4'; // v4：section 多信号推断 + 城市规范化，旧岗位缓存失效
 let jobsCache = null;
 function loadJobsCache() {
   if (jobsCache) return jobsCache;
@@ -61,7 +66,7 @@ function saveJobsCache() {
   try { fs.writeFileSync(JOBS_CACHE_PATH, JSON.stringify(jobsCache), 'utf8'); } catch {}
 }
 async function scrapeCompanyCached(company, opts) {
-  const key = `${company.adapter}|${company.name}|${opts.section || 'campus'}|${opts.keyword || ''}|${opts.maxJobs || ''}`;
+  const key = `${CACHE_VERSION}|${company.adapter}|${company.name}|${opts.section || 'campus'}|${opts.keyword || ''}|${opts.maxJobs || ''}`;
   const cache = loadJobsCache();
   const hit = cache[key];
   if (hit && hit.ts && Date.now() - hit.ts < JOBS_CACHE_TTL) return hit.result;
@@ -75,7 +80,7 @@ async function scrapeCompanyCached(company, opts) {
 // maxJobs 供冒烟自检传小值只抓少量；不传则各适配器用默认全量
 async function scrapeCompany(company, { section = 'campus', keyword = '', maxJobs } = {}) {
   switch (company.adapter) {
-    case 'zhiye': return zhiye.scrapeZhiye({ subdomain: company.subdomain, section, path: company.path, keyword, maxJobs, fallbackName: company.name });
+    case 'zhiye': return zhiye.scrapeZhiye({ subdomain: company.subdomain, base: company.base, section, path: company.path, keyword, maxJobs, fallbackName: company.name });
     case 'byte': { const c = company.byte || {}; return byte.scrapeByteDance({ section: c.section || section, keyword, maxJobs, base: c.base, campusPath: c.campusPath, socialPath: c.socialPath, fallbackName: company.name }); }
     case 'hotjob': return hotjob.scrapeHotjob({ suiteId: company.suiteId, section, keyword, maxJobs, base: company.base, fallbackName: company.name });
     case 'moka': { const c = company.moka || {}; return moka.scrapeMoka({ org: c.org, siteId: c.siteId, section: c.section || section, base: c.base, pathPrefix: c.pathPrefix, keyword, maxJobs, fallbackName: company.name }); }
@@ -97,9 +102,12 @@ async function scrapeCompany(company, { section = 'campus', keyword = '', maxJob
     case 'oppo': return oppo.scrapeOppo({ section, keyword, maxJobs, fallbackName: company.name });
     case 'byd': return byd.scrapeByd({ keyword, maxJobs, fallbackName: company.name });
     case 'pingan': return pingan.scrapePingan({ keyword, maxJobs, fallbackName: company.name });
-    case 'wecruit': return wecruit.scrapeWecruit({ suiteId: company.suiteId, section, keyword, maxJobs, fallbackName: company.name });
+    case 'wecruit': return wecruit.scrapeWecruit({ suiteId: company.suiteId, section, keyword, maxJobs, fallbackName: company.name, projectCode: company.projectCode });
     case 'huawei': return huawei.scrapeHuawei({ keyword, maxJobs, fallbackName: company.name });
     case 'vivo': return vivo.scrapeVivo({ keyword, maxJobs, fallbackName: company.name });
+    case 'tupu360': { const c = company.tupu360 || {}; return tupu360.scrapeTupu360({ base: c.base, tenant: c.tenant, section, maxJobs, fallbackName: company.name }); }
+    case 'workday': { const c = company.workday || {}; return workday.scrapeWorkday({ tenant: c.tenant, keyword, maxJobs, fallbackName: company.name }); }
+    case 'iguopin': { const c = company.iguopin || {}; return iguopin.scrapeIguopin({ nature: c.nature || '115xW5oQ', keyword, maxJobs, fallbackName: company.name, allCities: c.allCities }); }
     default: throw new Error(`「${company.name}」无可用适配器（adapter=${company.adapter || 'null'}）`);
   }
 }
@@ -114,7 +122,17 @@ const BROWSER_KEYWORD_ADAPTERS = new Set([]);
 
 // 读画像关键词，供分层搜索用。宽泛词（运营/数据分析/AI产品运营）单独搜会返回大量
 // 无关岗位稀释精度，改用「采购/供应链/品类」等精准词覆盖运营方向，故过滤掉。
-const WIDE_KEYWORDS = new Set(['运营', '数据分析', 'AI产品运营']);
+// 通用停用词（动词/泛化能力词，跨行业无区分度）：只过滤这些，不硬编码任何行业方向词（「运营」对运营岗是核心方向，不能一刀切）
+const WIDE_KEYWORDS = new Set(['优化', '管理', '支持', '提升', '负责', '跟进', '执行', '协调', '推动', '协助', '维护', '分析']);
+
+// 关键词过滤（WIDE_KEYWORDS 剔除 + 截断前 8）
+function filterKeywords(kws) {
+  const filtered = (kws || []).filter((k) => !WIDE_KEYWORDS.has(k)).slice(0, 8);
+  if (!filtered.length) {
+    throw new Error('画像关键词全被 WIDE_KEYWORDS 过滤（只剩宽泛词），请重新生成画像');
+  }
+  return filtered;
+}
 
 function loadSearchKeywords() {
   let p;
@@ -128,28 +146,23 @@ function loadSearchKeywords() {
   if (!kws.length) {
     throw new Error('画像关键词 search_portrait 缺失或为空：请先运行 node portrait.js 生成（分层搜索禁止静默回退全量）');
   }
-  const filtered = kws.filter((k) => !WIDE_KEYWORDS.has(k)).slice(0, 8);
-  if (!filtered.length) {
-    throw new Error('画像关键词全被 WIDE_KEYWORDS 过滤（只剩宽泛词），请运行 node portrait.js 重新生成');
-  }
-  return filtered;
+  return filterKeywords(kws);
 }
 
-// 候选人标识（换人 = 换 profile.owner，岗位按此隔离）
-function loadProfileKey() {
-  try {
-    const p = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'profile.json'), 'utf8'));
-    return (p.meta && p.meta.owner) || (p.identity && p.identity.legal_name) || 'default';
-  } catch { return 'default'; }
+// 候选人标识（换人 = 换 profile.owner，岗位按此隔离）。profile 可选：多用户时从参数传入，避免读全局文件
+function loadProfileKey(profile) {
+  const p = profile || (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'profile.json'), 'utf8')); } catch { return null; } })();
+  if (!p) return 'default';
+  return (p.meta && p.meta.owner) || (p.identity && p.identity.legal_name) || 'default';
 }
 
 // 读画像投递范围（apply_scopes）：应届生默认 ['campus','intern']；社招用户配 ['social']
-function loadApplyScopes() {
-  try {
-    const p = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'profile.json'), 'utf8'));
-    const scopes = (p.job_search && p.job_search.apply_scopes) || ['campus'];
-    return Array.isArray(scopes) && scopes.length ? scopes : ['campus'];
-  } catch { return ['campus']; }
+function loadApplyScopes(profile) {
+  const p = profile || (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'profile.json'), 'utf8')); } catch { return null; } })();
+  const DEFAULT = ['campus', 'intern']; // 应届生默认同时看校招+实习（此前只 ['campus']，实习岗位被漏导入）
+  if (!p) return DEFAULT;
+  const scopes = (p.job_search && p.job_search.apply_scopes) || DEFAULT;
+  return Array.isArray(scopes) && scopes.length ? scopes : DEFAULT;
 }
 
 // 抓一家：支持 keyword 的适配器多关键词搜索合并；否则全量抓
@@ -162,8 +175,62 @@ async function scrapeOne(company, opts = {}) {
   ]);
 }
 
+// 本地关键词过滤（面向全量预抓缓存）：title/JD/类型/团队 含任一关键词即命中
+function localKeywordFilter(jobs, keywords) {
+  const kws = (keywords || []).filter((k) => k && String(k).length >= 2);
+  if (!kws.length) return jobs;
+  return jobs.filter((j) => {
+    const text = `${j.title || ''} ${j.jd || ''} ${j.type || ''} ${j.team || ''}`.toLowerCase();
+    return kws.some((k) => text.includes(String(k).toLowerCase()));
+  });
+}
+
+// 城市英文/拼音 → 中文 映射（主要城市，覆盖校招常见中英混用）
+const CITY_ALIAS = {
+  beijing: '北京', shanghai: '上海', guangzhou: '广州', shenzhen: '深圳',
+  hangzhou: '杭州', nanjing: '南京', wuhan: '武汉', chengdu: '成都',
+  xian: '西安', suzhou: '苏州', tianjin: '天津', chongqing: '重庆',
+  changsha: '长沙', zhengzhou: '郑州', qingdao: '青岛', jinan: '济南',
+  hefei: '合肥', xiamen: '厦门', fuzhou: '福州', ningbo: '宁波',
+  wuxi: '无锡', foshan: '佛山', dongguan: '东莞', zhuhai: '珠海',
+  dalian: '大连', shenyang: '沈阳', harbin: '哈尔滨', changchun: '长春',
+  kunming: '昆明', guiyang: '贵阳', nanchang: '南昌', nanning: '南宁',
+  shijiazhuang: '石家庄', taiyuan: '太原', lanzhou: '兰州', urumqi: '乌鲁木齐',
+  hongkong: '香港', macau: '澳门', taipei: '台北',
+};
+
+// 城市拆分 + 归一化：处理「北京、上海」「广东省·深圳市」「BeiJing」「上海市嘉定区」等格式，
+// 英文转中文 + 区县归属市 + 去后缀，让「北京」=「北京市」=「BeiJing」=「北京市朝阳区」，避免城市列表爆炸
+function splitCities(loc) {
+  const parts = String(loc || '').split(/[、,，/;·\s]+/).map((s) => s.trim()).filter(Boolean);
+  const result = new Set();
+  for (let p of parts) {
+    // 1. 英文/拼音 → 中文（忽略大小写）
+    const lower = p.toLowerCase();
+    if (CITY_ALIAS[lower]) { result.add(CITY_ALIAS[lower]); continue; }
+    // 2. 区县归属：「XX市YY区/县」→ 提取「XX」（如「上海市嘉定区」→「上海」）
+    const cityInDistrict = p.match(/^([一-龥]{2,8}?)市(?:[一-龥]{2,8}?(?:区|县|市))?/);
+    if (cityInDistrict && cityInDistrict[1]) { result.add(cityInDistrict[1]); continue; }
+    // 3. 去后缀（省/市/自治区/地区/自治州/盟）
+    const stripped = p.replace(/(省|市|自治区|特别行政区|壮族自治区|回族自治区|维吾尔自治区|地区|自治州|盟)$/, '');
+    if (stripped) result.add(stripped);
+  }
+  return [...result].filter(Boolean);
+}
+
 async function scrapeOneInner(company, { section, keywords = [], keywordLimit = 1 } = {}) {
-  // 返回 { jobs, searchMode }：searchMode = 'keyword'（关键词精准）/ 'fallback'（回退全量）。
+  // 返回 { jobs, searchMode }：searchMode = 'prefetched'（全量缓存命中本地过滤）/ 'keyword' / 'fallback'
+  // 优先：全量预抓缓存命中（新鲜）→ 本地关键词过滤，不调官网（面向大众，各取所需，秒出）
+  const cache = loadJobsCache();
+  const prefetchKey = `${CACHE_VERSION}|${company.adapter}|${company.name}|${section || 'campus'}|${''}|200`;
+  const prefetched = cache[prefetchKey];
+  if (prefetched && prefetched.ts && Date.now() - prefetched.ts < JOBS_CACHE_TTL) {
+    const all = (prefetched.result && prefetched.result.jobs) || [];
+    if (all.length) {
+      const jobs = keywords.length ? localKeywordFilter(all, keywords) : all;
+      return { jobs, searchMode: 'prefetched' };
+    }
+  }
   // 关键：关键词搜索「全部失败」≠「无命中」——全部失败说明接口/认证坏了，抛错阻断，禁止静默回退全量掩盖失效。
   if (KEYWORD_ADAPTERS.has(company.adapter) && keywords.length) {
     const kws = keywords.slice(0, KEYWORD_COUNT[company.adapter] || keywordLimit); // 多关键词召回
@@ -210,15 +277,18 @@ function targetCompanies() {
 }
 
 // 一键扫描
-async function scanAll({ section, importToBoard = true, onProgress, onLive, concurrency = 30, userId = '' } = {}) {
+async function scanAll({ section, importToBoard = true, onProgress, onLive, concurrency = 30, userId = '', profile, searchPortrait } = {}) {
   const progress = (msg) => { if (onProgress) onProgress(msg); };
   const t0 = Date.now();
   const targets = targetCompanies();
-  const keywords = loadSearchKeywords();
+  // 多用户隔离：searchPortrait/profile 由 API 传入，避免读全局 profile.json 串画像；CLI 无参时回退读文件
+  const keywords = (searchPortrait && searchPortrait.keywords && searchPortrait.keywords.length)
+    ? filterKeywords(searchPortrait.keywords)
+    : loadSearchKeywords();
   const keywordHash = crypto.createHash('md5').update(keywords.join('|')).digest('hex').slice(0, 8);
-  const profileKey = loadProfileKey();
+  const profileKey = loadProfileKey(profile);
   // 单 scope 抓取（默认画像 apply_scopes 首项，通常 campus）。section 区分靠岗位字段判断（jobType/hireMode/seasonType），不翻倍抓取
-  const applyScopes = loadApplyScopes();
+  const applyScopes = loadApplyScopes(profile);
   const scope = section || (applyScopes[0] || 'campus');
   const prevHealth = health.loadHealth();
   const allJobs = [];
@@ -237,14 +307,18 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
           const jobs = (rawJobs || []).map((j) => {
             const jobId = String(j.id || j.job_id || '');
             const reach = c.reach || {};
+            // detailUrl 优先用适配器返回的（最了解正确 URL 结构），reach 配置只作兜底（适配器没返回时）
             let detailUrl = j.detailUrl || j.url || '';
-            if (reach.type === 'direct' && reach.urlTemplate && jobId) {
+            if (!detailUrl && reach.type === 'direct' && reach.urlTemplate && jobId) {
               detailUrl = reach.urlTemplate.replace('{id}', jobId);
-            } else if (reach.type === 'navigate') {
-              detailUrl = reach.entryUrl || detailUrl;
+            } else if (!detailUrl && reach.type === 'navigate') {
+              detailUrl = reach.entryUrl || '';
             }
             // section 优先用适配器从岗位字段判断的结果（jobType/hireMode/seasonType），否则用抓取 scope
-            return { ...j, company: c.name, sourceAdapter: c.adapter, job_id: jobId, detailUrl, section: j.section || scope };
+            // industry 用公司分组兜底（适配器不填），供看板行业筛选；city 统一用 location（适配器字段名）
+            // location 可能是「北京、上海」多城市拼接 → 拆成城市数组，city 取首个，供筛选按单城市匹配
+            const cities = splitCities(j.city || j.location);
+            return { ...j, company: c.name, sourceAdapter: c.adapter, job_id: jobId, detailUrl, section: j.section || scope, industry: j.industry || c.group || '', city: cities[0] || '', cities };
           });
           return { company: c, ok: true, jobs, searchMode };
         } catch (e) {
@@ -268,17 +342,21 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
   }
   progress(`扫描完成，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
-  // 语义召回兜底：关键词无命中的公司，全量抓 + embedding 召回语义相关的岗位（防漏），并发处理
-  // 已关闭（2026-08-29 用户要求提速）：全量抓 36 家太慢，防漏价值不抵耗时。保留代码可随时开
-  if (false && pendingRecall.length) {
+  // 语义召回兜底：关键词无命中的公司，从预抓缓存读全量 + embedding 召回语义相关的岗位（防漏）
+  // 重开（有全量预抓缓存后，不再需要重新全量抓官网，直接用缓存做 embedding 召回，快且防漏）
+  if (pendingRecall.length) {
     progress(`语义召回兜底 ${pendingRecall.length} 家关键词无命中的公司…`);
-    const query = keywords.join(' ');
+    // 语义召回 query 用聚焦方向（search_portrait.directions），不用含泛化词的 target_roles 或全量 keywords
+    const portrait = profile && profile.job_search && profile.job_search.search_portrait;
+    const directions = (portrait && Array.isArray(portrait.directions)) ? portrait.directions.join(' ') : '';
+    const query = directions || keywords.join(' ');
     const recallConcurrency = 10;
     for (let i = 0; i < pendingRecall.length; i += recallConcurrency) {
       const group = pendingRecall.slice(i, i + recallConcurrency);
       const groupResults = await Promise.all(group.map(async (c) => {
         try {
-          const full = await scrapeCompany(c, { section: scope, maxJobs: 100 });
+          // 从预抓缓存读全量（key 与 prefetch.js 一致：空 keyword + maxJobs=200），命中则不再调官网
+          const full = await scrapeCompanyCached(c, { section: scope, maxJobs: 200 });
           const fullJobs = (full && full.jobs) || [];
           if (!fullJobs.length) return [];
           const recalled = await embedding.semanticRecall(query, fullJobs, { topK: 20 });
@@ -287,10 +365,13 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
             const jobId = String(j.id || j.job_id || '');
             if (!jobId) return null;
             const reach = c.reach || {};
+            // 同主抓取：适配器 detailUrl 优先，reach 兜底
             let detailUrl = j.detailUrl || j.url || '';
-            if (reach.type === 'direct' && reach.urlTemplate) detailUrl = reach.urlTemplate.replace('{id}', jobId);
-            else if (reach.type === 'navigate') detailUrl = reach.entryUrl || detailUrl;
-            return { ...j, company: c.name, sourceAdapter: c.adapter, job_id: jobId, detailUrl, section: scope, recalled: true, recallScore: x.score };
+            if (!detailUrl && reach.type === 'direct' && reach.urlTemplate) detailUrl = reach.urlTemplate.replace('{id}', jobId);
+            else if (!detailUrl && reach.type === 'navigate') detailUrl = reach.entryUrl || '';
+            // 与主抓取组装一致：补 city/cities/industry；section 用岗位字段判断（j.section 含实习判断），而非写死 scope
+            const cities = splitCities(j.city || j.location);
+            return { ...j, company: c.name, sourceAdapter: c.adapter, job_id: jobId, detailUrl, section: j.section || scope, industry: j.industry || c.group || '', city: cities[0] || '', cities, recalled: true, recallScore: x.score };
           }).filter(Boolean);
         } catch (e) {
           progress(`  ⚠ ${c.name} 语义召回失败：${e.message.slice(0, 100)}`);
@@ -314,7 +395,7 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
   let scored = null;
   if (allJobs.length) {
     progress(`精排打分中…（共 ${allJobs.length} 个岗位，粗排裁剪）`);
-    scored = await scorer.scoreJobs(allJobs, { preFilter: true, onProgress: progress }); // 粗排裁剪到 300 再精排
+    scored = await scorer.scoreJobs(allJobs, { preFilter: true, onProgress: progress, profile }); // 粗排裁剪到 300 再精排；传 profile 避免回退读全局旧文件
     progress(`打分完成，总耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   }
 
@@ -322,7 +403,7 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
   if (recalledJobs.length) {
     progress(`兜底岗位单独判定…（共 ${recalledJobs.length} 个语义召回岗位）`);
     try {
-      const recalledScored = await scorer.scoreJobs(recalledJobs, { rrCap: 30 });
+      const recalledScored = await scorer.scoreJobs(recalledJobs, { rrCap: 30, profile });
       if (recalledScored && recalledScored.recommended.length) {
         scored = scored || { recommended: [], overflow: [], tiers: { A: [], B: [], C: [], D: [] } };
         scored.recommended = scored.recommended.concat(recalledScored.recommended);
@@ -357,6 +438,7 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
           status: 'pending',
           source: '官网扫描',
           degree: j.degree || j.education || '',
+          city: j.city || j.location || '',
           industry: j.industry || '',
           jd: j.jd || '',
           job_id: jobId,
@@ -411,6 +493,8 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
     detailUrl: j.detailUrl || j.url || '',
     job_id: j.job_id,
     city: j.city || '',
+    cities: j.cities || [j.city],
+    industry: j.industry || '',
     section: j.section || scope,
   }));
 
@@ -428,7 +512,7 @@ async function scanAll({ section, importToBoard = true, onProgress, onLive, conc
   };
 }
 
-module.exports = { scanAll, targetCompanies, scrapeCompany, scrapeOne };
+module.exports = { scanAll, targetCompanies, scrapeCompany, scrapeOne, scrapeCompanyCached };
 
 // 命令行直接跑：node scan.js
 if (require.main === module) {

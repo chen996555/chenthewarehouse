@@ -23,13 +23,14 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 // 招聘版块 → 路径
 const SECTION_PATH = { campus: 'campus', social: 'social', intern: 'intern' };
-// 招聘版块 → 新版接口 Category 值（校招 = 2；社招/实习未确认，暂走回退）
-const CATEGORY_BY_SECTION = { campus: ['2'] };
+// 招聘版块 → 新版接口 Category 值（1=社招、2=校招、3=实习，实测中金/东鹏/良品铺子确认）
+const CATEGORY_BY_SECTION = { campus: ['2'], social: ['1'], intern: ['3'] };
 
 // 新版接口岗位记录 → 统一岗位结构
-function mapApiJob(it, subdomain, listUrl) {
+function mapApiJob(it, subdomain, listUrl, apiBase) {
   const name = String(it.JobAdName || '');
   const tm = name.match(/^(.+?)\s*\(J(\d+)\)\s*$/);
+  const base = apiBase || `https://${subdomain}.zhiye.com`;
   return {
     id: String(it.JobAdId || ''),
     title: (tm ? tm[1] : name).trim(),
@@ -37,13 +38,13 @@ function mapApiJob(it, subdomain, listUrl) {
     employmentType: '',
     location: (Array.isArray(it.LocNames) ? it.LocNames : []).join('、'),
     date: String(it.PostDate || '').slice(0, 10),
-    detailUrl: `https://${subdomain}.zhiye.com/zpdetail/${it.JobAdId}`,
+    detailUrl: `${base}/zpdetail/${it.JobAdId}`,
     jd: [it.Duty, it.Require].filter(Boolean).join('\n'),
   };
 }
 
 // 纯 HTTP 拉取新版门户岗位（支持关键词 + 分页真全量）
-async function scrapeViaApi({ subdomain, category, keyword, maxJobs, listUrl }) {
+async function scrapeViaApi({ subdomain, apiBase, category, keyword, maxJobs, listUrl }) {
   const pageSize = 20;
   const cap = Math.min(Math.max(Number(maxJobs) || 300, 10), 1000);
   const jobs = [];
@@ -59,7 +60,7 @@ async function scrapeViaApi({ subdomain, category, keyword, maxJobs, listUrl }) 
       PortalId: '',
       DisplayFields: ['Category', 'Kind', 'LocId', 'PostDate', 'ClassificationOne', 'WorkWeChatQrCode'],
     });
-    const res = await fetch(`https://${subdomain}.zhiye.com/api/Jobad/GetJobAdPageList`, {
+    const res = await fetch(`${apiBase}/api/Jobad/GetJobAdPageList`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
       body,
@@ -70,10 +71,67 @@ async function scrapeViaApi({ subdomain, category, keyword, maxJobs, listUrl }) 
     if (pageIndex === 0) total = Number(j.Count ?? j.Total ?? j.total ?? j.count) || 0;
     const items = j.Data || [];
     if (!items.length) break;
-    for (const it of items) jobs.push(mapApiJob(it, subdomain, listUrl));
+    for (const it of items) jobs.push(mapApiJob(it, subdomain, listUrl, apiBase));
     if (items.length < pageSize || jobs.length >= (total || cap)) break;
   }
   return { jobs, total };
+}
+
+// 旧版门户（jobsTable 表格布局）纯 HTTP HTML 解析 —— 替代 Puppeteer，更快
+// 结构：<table class="jobsTable|listtable"><tr class="title|tabletitle">表头</tr><tr><td><a title="岗位" href="/zpdetail/{id}?PageIndex=N">岗位</a></td><td>类型</td><td>地点</td><td>时间</td></tr>...</table>
+// 分页：/social/?PageIndex=N（列表页 /social/jobs 为第 1 页）；总页数从 _MvcPager_GoToPage(...,N) 提取
+function parseOldHtmlTable(html, apiBase) {
+  const tm = html.match(/<table[^>]*class="[^"]*(jobsTable|listtable)[^"]*"[^>]*>([\s\S]*?)<\/table>/);
+  if (!tm) return { jobs: [], total: 0, totalPage: 1 };
+  const rows = tm[2].match(/<tr[\s\S]*?<\/tr>/g) || [];
+  const clean = (s) => String(s || '').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+  const jobs = [];
+  for (const tr of rows) {
+    if (/class="(title|tabletitle)"/.test(tr) || /<th[\s>]/i.test(tr)) continue;
+    const am = tr.match(/<a[^>]*title="([^"]*)"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/);
+    if (!am) continue;
+    const tds = tr.match(/<td[^>]*>([\s\S]*?)<\/td>/g) || [];
+    const href = clean(am[2]);
+    const id = (href.match(/zpdetail\/(\d+)/) || [])[1] || '';
+    if (!id) continue;
+    jobs.push({
+      id,
+      title: clean(am[1] || am[3]),
+      category: tds[1] ? clean(tds[1]) : '',
+      employmentType: '',
+      location: tds[2] ? clean(tds[2]) : '',
+      date: tds[3] ? clean(tds[3]) : '',
+      detailUrl: href.startsWith('http') ? href : `${apiBase}${href}`,
+      jd: '',
+    });
+  }
+  const totalM = html.match(/共\s*(\d+)\s*条/);
+  const pageM = html.match(/_MvcPager_GoToPage\([^,]+,\s*(\d+)\s*\)/);
+  return { jobs, total: totalM ? +totalM[1] : 0, totalPage: pageM ? +pageM[1] : 1 };
+}
+
+// 旧版门户纯 HTTP 分页抓取（无需浏览器）
+// path 自定义列表路径（如 'alljob'），默认 {section}/jobs
+async function scrapeOldHtml({ apiBase, section, maxJobs, path }) {
+  const cap = Math.min(Math.max(Number(maxJobs) || 300, 10), 1000);
+  const listPath = path || `${SECTION_PATH[section] || section}/jobs`;
+  const pageBase = listPath.replace(/\/jobs$/, ''); // 'social/jobs'→'social'；'alljob'→'alljob'
+  const seen = new Set();
+  const jobs = [];
+  let total = 0;
+  let totalPage = 1;
+  for (let p = 1; jobs.length < cap; p++) {
+    const url = p === 1 ? `${apiBase}/${listPath}` : `${apiBase}/${pageBase}/?PageIndex=${p}`;
+    const res = await fetch(url, { headers: { 'User-Agent': UA } });
+    if (!res.ok) break;
+    const html = await res.text();
+    const r = parseOldHtmlTable(html, apiBase);
+    if (p === 1) { total = r.total; totalPage = r.totalPage || 1; }
+    if (!r.jobs.length) break;
+    for (const j of r.jobs) if (!seen.has(j.id)) { seen.add(j.id); jobs.push(j); }
+    if (p >= totalPage || r.jobs.length < 15) break;
+  }
+  return { jobs, total, totalPage };
 }
 
 // 旧版门户（表格布局）DOM 解析（保留原逻辑作回退）
@@ -184,23 +242,32 @@ async function scrapeViaPuppeteer({ subdomain, url, fallbackName }) {
  * @param {string} path    可选自定义路径
  * @param {string} keyword 可选关键词（新版门户接口支持）
  */
-async function scrapeZhiye({ subdomain, section = 'campus', path, keyword = '', maxJobs = 300, fallbackName = '' } = {}) {
+async function scrapeZhiye({ subdomain, base, section = 'campus', path, keyword = '', maxJobs = 300, fallbackName = '' } = {}) {
   subdomain = String(subdomain || '').trim().replace(/^https?:\/\//, '').replace(/\.zhiye\.com.*/, '');
-  if (!subdomain) throw new Error('请提供 zhiye.com 子域名，如 beisen');
+  const apiBase = base || `https://${subdomain}.zhiye.com`;
+  if (!subdomain && !base) throw new Error('请提供 zhiye.com 子域名或 base 域名');
 
   const resolvedPath = path || `${SECTION_PATH[section] || section}/jobs`;
-  const url = `https://${subdomain}.zhiye.com/${resolvedPath}`.replace(/\/+$/, '');
+  const url = `${apiBase}/${resolvedPath}`.replace(/\/+$/, '');
   const category = CATEGORY_BY_SECTION[section];
 
   // 新版门户：纯 HTTP 接口优先（完整 JD + 关键词 + 分页）
   if (category) {
     try {
-      const { jobs, total } = await scrapeViaApi({ subdomain, category, keyword, maxJobs, listUrl: url });
+      const { jobs, total } = await scrapeViaApi({ subdomain, apiBase, category, keyword, maxJobs, listUrl: url });
       if (jobs.length) {
-        return { subdomain, company: fallbackName || subdomain, url, section, keyword, totalOnSite: total, count: jobs.length, jobs };
+        return { subdomain, company: fallbackName || subdomain || base, url, section, keyword, totalOnSite: total, count: jobs.length, jobs };
       }
-    } catch { /* 接口失败，回退 DOM */ }
+    } catch { /* 接口失败，回退旧版 HTML */ }
   }
+
+  // 旧版门户：纯 HTTP HTML 解析（jobsTable/listtable 表格），无需浏览器（更快），所有 section 通用
+  try {
+    const { jobs, total } = await scrapeOldHtml({ apiBase, section, maxJobs, path: resolvedPath });
+    if (jobs.length) {
+      return { subdomain, company: fallbackName || subdomain || base, url, section, keyword, totalOnSite: total, count: jobs.length, jobs, portalVersion: 'old-html' };
+    }
+  } catch { /* HTML 解析失败，回退 Puppeteer */ }
 
   // 旧版门户 / 接口返回 0：回退 Puppeteer DOM
   const r = await scrapeViaPuppeteer({ subdomain, url, fallbackName });

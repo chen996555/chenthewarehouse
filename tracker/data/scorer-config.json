@@ -1,9 +1,0 @@
-{
-  "baseUrl": "https://api.deepseek.com",
-  "judgeModel": "deepseek-chat",
-  "reranker": {
-    "mode": "api",
-    "baseUrl": "https://api.siliconflow.cn",
-    "model": "BAAI/bge-reranker-v2-m3"
-  }
-}

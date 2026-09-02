@@ -1,6 +1,6 @@
 'use strict';
 // popup：简历 → 画像 → 推荐 → 自动填充（调云端后端）
-const CLOUD_URL = 'http://localhost:8630';
+const CLOUD_URL = 'http://182.92.156.235:8630';
 
 const $ = (id) => document.getElementById(id);
 

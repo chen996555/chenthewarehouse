@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "求职星 · 自动填充",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "校招/社招网申投递表单自动填充（不自动提交）",
-  "permissions": ["activeTab", "storage", "scripting", "sidePanel"],
-  "host_permissions": ["http://localhost:8630/*"],
+  "permissions": ["activeTab", "storage", "scripting", "sidePanel", "tabs"],
+  "host_permissions": ["http://localhost:8630/*", "http://182.92.156.235:8630/*"],
   "background": {
     "service_worker": "background.js"
   },

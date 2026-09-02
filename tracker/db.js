@@ -22,18 +22,20 @@ const STATUSES = {
   interview: { label: '面试',   color: '#8b5cf6' },
   offer:     { label: 'Offer',  color: '#22c55e' },
   rejected:  { label: '拒信',   color: '#ef4444' },
+  dismissed: { label: '移除',   color: '#94a3b8' },
 };
 
-const STATUS_ORDER = ['pending', 'applied', 'replied', 'interview', 'offer', 'rejected'];
+const STATUS_ORDER = ['pending', 'applied', 'replied', 'interview', 'offer', 'rejected', 'dismissed'];
 
 // 每个状态的「推荐下一步」（供前端展示推进按钮；拖拽/下拉仍可任意设置）
 const TRANSITIONS = {
-  pending:   ['applied'],
-  applied:   ['replied', 'rejected'],
-  replied:   ['interview', 'rejected'],
-  interview: ['offer', 'rejected'],
+  pending:   ['applied', 'dismissed'],
+  applied:   ['replied', 'rejected', 'dismissed'],
+  replied:   ['interview', 'rejected', 'dismissed'],
+  interview: ['offer', 'rejected', 'dismissed'],
   offer:     [],
   rejected:  [],
+  dismissed: [],
 };
 
 const CHANNELS = ['官网', 'Boss直聘', '猎聘', '智联', '前程无忧', '内推', '邮件', '其他'];
@@ -119,6 +121,7 @@ function _migrateColumns(db) {
     section: "TEXT DEFAULT 'campus'",
     applied_at: "TEXT DEFAULT ''",
     user_id: "TEXT DEFAULT ''",
+    dismiss_reason: "TEXT DEFAULT ''",
   };
   for (const [name, def] of Object.entries(additions)) {
     if (!cols.has(name)) {
@@ -173,6 +176,7 @@ function sanitizeApplication(input) {
     section: str(input.section) || 'campus',
     applied_at: str(input.applied_at),
     user_id: str(input.user_id),
+    dismiss_reason: str(input.dismiss_reason),
   };
 }
 
@@ -185,8 +189,10 @@ function listApplications(db, userId) {
   return rows.map(normalizeRow);
 }
 
-function getApplication(db, id) {
-  const row = db.prepare('SELECT * FROM applications WHERE id = ?').get(id);
+function getApplication(db, id, userId) {
+  const row = userId
+    ? db.prepare('SELECT * FROM applications WHERE id = ? AND user_id = ?').get(id, String(userId))
+    : db.prepare('SELECT * FROM applications WHERE id = ?').get(id);
   return row ? normalizeRow(row) : null;
 }
 
@@ -243,8 +249,8 @@ function syncApplication(db, input) {
   return { sync: 'updated', application: getApplication(db, existing.id) };
 }
 
-function updateApplication(db, id, input) {
-  const existing = getApplication(db, id);
+function updateApplication(db, id, input, userId) {
+  const existing = getApplication(db, id, userId);
   if (!existing) return null;
 
   const data = sanitizeApplication({ ...existing, ...input });
@@ -260,10 +266,10 @@ function updateApplication(db, id, input) {
       status = ?, notes = ?, follow_up_date = ?,
       source = ?, degree = ?, industry = ?, jd = ?, job_id = ?, profile_key = ?,
       score = ?, tier = ?, gate = ?, judge_reason = ?, gate_reasons = ?,
-      raw_status = ?, status_synced_at = ?, section = ?, applied_at = ?,
+      raw_status = ?, status_synced_at = ?, section = ?, applied_at = ?, dismiss_reason = ?,
       updated_at = datetime('now','localtime')
     WHERE id = ?
-  `).run(data.company, data.title, data.channel, data.url, data.city, data.salary, data.status, data.notes, data.follow_up_date, data.source, data.degree, data.industry, data.jd, data.job_id, data.profile_key, data.score, data.tier, data.gate, data.judge_reason, data.gate_reasons, data.raw_status, data.status_synced_at, data.section, data.applied_at, id);
+  `).run(data.company, data.title, data.channel, data.url, data.city, data.salary, data.status, data.notes, data.follow_up_date, data.source, data.degree, data.industry, data.jd, data.job_id, data.profile_key, data.score, data.tier, data.gate, data.judge_reason, data.gate_reasons, data.raw_status, data.status_synced_at, data.section, data.applied_at, data.dismiss_reason, id);
 
   // 状态发生变化时写入审计日志
   if (data.status !== existing.status) {
@@ -284,28 +290,39 @@ function advanceStatus(db, id, nextStatus) {
   return updateApplication(db, id, { status: target });
 }
 
-function deleteApplication(db, id) {
-  const existing = getApplication(db, id);
+function deleteApplication(db, id, userId) {
+  const existing = getApplication(db, id, userId);
   if (!existing) return false;
   db.prepare('DELETE FROM applications WHERE id = ?').run(id);
   return true;
 }
 
-function getHistory(db, id) {
+function getHistory(db, id, userId) {
+  if (userId && !getApplication(db, id, userId)) return []; // 越权校验：不归属该用户则空
   return db.prepare(
     'SELECT * FROM history WHERE application_id = ? ORDER BY id DESC'
   ).all(id).map(normalizeRow);
 }
 
-function getActivity(db, limit = 20) {
-  const rows = db.prepare(`
-    SELECT h.id, h.application_id, h.action, h.detail, h.created_at,
-           a.company, a.title, a.status
-    FROM history h
-    LEFT JOIN applications a ON a.id = h.application_id
-    ORDER BY h.id DESC
-    LIMIT ?
-  `).all(limit);
+function getActivity(db, userId, limit = 20) {
+  const rows = userId
+    ? db.prepare(`
+        SELECT h.id, h.application_id, h.action, h.detail, h.created_at,
+               a.company, a.title, a.status
+        FROM history h
+        LEFT JOIN applications a ON a.id = h.application_id
+        WHERE a.user_id = ?
+        ORDER BY h.id DESC
+        LIMIT ?
+      `).all(String(userId), limit)
+    : db.prepare(`
+        SELECT h.id, h.application_id, h.action, h.detail, h.created_at,
+               a.company, a.title, a.status
+        FROM history h
+        LEFT JOIN applications a ON a.id = h.application_id
+        ORDER BY h.id DESC
+        LIMIT ?
+      `).all(limit);
   return rows.map(normalizeRow);
 }
 
@@ -406,6 +423,25 @@ function findByJobId(db, jobId, company, userId) {
   return row ? normalizeRow(row) : null;
 }
 
+// 导出用户全部数据（画像 + 投递记录），用于「数据可携带权」（个保法）
+function getUserData(db, userId) {
+  const user = db.prepare('SELECT id, username, profile, created_at FROM users WHERE id = ?').get(userId);
+  if (!user) return null;
+  let profile = {};
+  try { profile = JSON.parse(user.profile); } catch {}
+  const applications = db.prepare('SELECT * FROM applications WHERE user_id = ? ORDER BY created_at DESC').all(String(userId)).map(normalizeRow);
+  return { username: user.username, created_at: user.created_at, profile, applications };
+}
+
+// 删除用户账号 + 关联数据（被遗忘权）。applications 删除时 history 由外键 CASCADE 级联删
+function deleteUser(db, userId) {
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(userId);
+  if (!user) return false;
+  db.prepare('DELETE FROM applications WHERE user_id = ?').run(String(userId));
+  db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+  return true;
+}
+
 module.exports = {
   getDb,
   STATUSES,
@@ -429,5 +465,7 @@ module.exports = {
   updateUserProfile,
   getUserProfile,
   findByJobId,
+  getUserData,
+  deleteUser,
   hashPassword,
 };

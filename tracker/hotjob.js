@@ -12,6 +12,7 @@
 
 const DEFAULT_BASE = 'https://wecruit.hotjob.cn';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const { inferSection } = require('./section');
 
 async function fetchHotjobPage({ base, suiteId, recruitType, currentPage, pageSize, keyword }) {
   const url = `${base}/wecruit/positionInfo/listPosition/${suiteId}?iSaJAx=isAjax&request_locale=zh_CN&t=${Date.now()}`;
@@ -43,14 +44,18 @@ function mapHotjobJob(p, suiteId, base, recruitType) {
   // 去重用可读 postCode；详情 URL 必须用 postId（数字哈希，postCode 会 404）
   const id = postCode || postId;
   const postType = recruitType === 2 ? 'social' : 'campus';
+  const title = String(p.postName || '').trim();
+  const type = String(p.postTypeName || '').trim();
+  // section：recruitType=2 明确社招；recruitType=1 校园招聘（可能混实习）用多信号推断
+  const section = recruitType === 2 ? 'social' : inferSection('campus', { title, type });
   return {
     id,
     postId,
-    title: String(p.postName || '').trim(),
+    title,
     team: p.orgName || p.company || '',
     location: String(p.workPlaceStr || '').trim(),
     type: String(p.postTypeName || '').trim(),
-    section: recruitType === 2 ? 'social' : 'campus',
+    section,
     program: '',
     date: String(p.publishDate || '').slice(0, 10),
     detailUrl: p.postUrl || `${base}/${suiteId}/pb/posDetail.html?postId=${postId}&postType=${postType}`,

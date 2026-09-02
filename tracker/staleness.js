@@ -26,10 +26,10 @@ async function detectStale({ companyName, section = 'campus', keyword = '' } = {
   return { company: companyName, onlineCount: onlineIds.size, dbCount: dbRows.length, stale };
 }
 
-// 检测所有互联网公司（全量抓，耗时）
+// 检测所有已点亮公司（全量抓，耗时；按 group 过滤是分类重构前的历史遗留，会漏掉非互联网组）
 async function detectAllStale({ section = 'campus' } = {}) {
   const results = [];
-  const targets = companies.COMPANIES.filter((c) => c.group === '互联网' && c.adapter);
+  const targets = companies.COMPANIES.filter((c) => c.adapter);
   for (const c of targets) {
     try {
       const r = await detectStale({ companyName: c.name, section });
@@ -43,7 +43,7 @@ async function detectAllStale({ section = 'campus' } = {}) {
 
 module.exports = { detectStale, detectAllStale };
 
-// 命令行：node staleness.js [公司名]  不传则检测所有互联网公司
+// 命令行：node staleness.js [公司名]  不传则检测所有已点亮公司
 if (require.main === module) {
   const name = process.argv[2] || '';
   const run = name ? detectStale({ companyName: name }) : detectAllStale({});

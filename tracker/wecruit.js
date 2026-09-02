@@ -13,8 +13,9 @@
 
 const BASE = 'https://wecruit.hotjob.cn';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const { inferSection } = require('./section');
 
-async function fetchWecruitPage({ suiteId, recruitType, currentPage, pageSize, keyword }) {
+async function fetchWecruitPage({ suiteId, recruitType, currentPage, pageSize, keyword, projectCode }) {
   const url = `${BASE}/wecruit/positionInfo/listPosition/${suiteId}?iSaJAx=isAjax&request_locale=zh_CN&t=${Date.now()}`;
   const form = new URLSearchParams({
     isFrompb: 'true',
@@ -23,6 +24,7 @@ async function fetchWecruitPage({ suiteId, recruitType, currentPage, pageSize, k
     currentPage: String(currentPage),
   });
   if (keyword) form.set('postName', keyword);
+  if (projectCode) form.set('projectCode', projectCode);
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -43,14 +45,18 @@ function mapWecruitJob(p, suiteId, recruitType) {
   const postCode = String(p.postCode || '');
   // 去重用可读的 postCode；详情是「展开式」（无独立详情页），详情 URL 指向列表页，JD 走 listPositionDetail 接口
   const id = postCode || postId;
+  const title = String(p.postName || '').trim();
+  const type = String(p.postTypeName || '').trim();
+  // section：recruitType=2 明确社招；recruitType=1 校园招聘（可能混实习）用多信号推断（覆盖「暑期/夏令营/日常实习」等）
+  const section = recruitType === 2 ? 'social' : inferSection('campus', { title, type });
   return {
     id,
     postId,
-    title: String(p.postName || '').trim(),
+    title,
     team: p.orgName || p.company || '',
     location: String(p.workPlaceStr || '').trim(),
     type: String(p.postTypeName || '').trim(),
-    section: recruitType === 2 ? 'social' : 'campus',
+    section,
     program: '',
     date: '',
     detailUrl: `${BASE}/${suiteId}/pb/school.html`,
@@ -90,7 +96,7 @@ async function fetchWecruitDetail({ suiteId, postId }) {
   };
 }
 
-async function scrapeWecruit({ suiteId, section = 'campus', keyword = '', maxJobs = 100, fallbackName = '' } = {}) {
+async function scrapeWecruit({ suiteId, section = 'campus', keyword = '', maxJobs = 100, fallbackName = '', projectCode = '' } = {}) {
   if (!suiteId) throw new Error('缺少 wecruit 机构 ID（suiteId）');
   const recruitType = section === 'social' ? 2 : 1;
   const cap = Math.min(Math.max(Number(maxJobs) || 100, 10), 300);
@@ -100,7 +106,7 @@ async function scrapeWecruit({ suiteId, section = 'campus', keyword = '', maxJob
   let total = 0;
 
   for (let currentPage = 1; jobs.length < cap; currentPage++) {
-    const j = await fetchWecruitPage({ suiteId, recruitType, currentPage, pageSize, keyword });
+    const j = await fetchWecruitPage({ suiteId, recruitType, currentPage, pageSize, keyword, projectCode });
     if (!j || j.state !== '200' || !j.data || !j.data.pageForm) break;
     const pageForm = j.data.pageForm;
     if (currentPage === 1) total = Number(pageForm.dataCount || (pageForm.totalPage || 0) * pageSize || 0);
